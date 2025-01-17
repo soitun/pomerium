@@ -12,6 +12,7 @@ import (
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
+	"github.com/pomerium/pomerium/pkg/contextutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	"github.com/pomerium/pomerium/pkg/policy"
 	"github.com/pomerium/pomerium/pkg/policy/criteria"
@@ -27,6 +28,7 @@ type PolicyRequest struct {
 // PolicyResponse is the result of evaluating a policy.
 type PolicyResponse struct {
 	Allow, Deny RuleResult
+	Traces      []contextutil.PolicyEvaluationTrace
 }
 
 // NewPolicyResponse creates a new PolicyResponse.
@@ -41,7 +43,7 @@ func NewPolicyResponse() *PolicyResponse {
 type RuleResult struct {
 	Value          bool
 	Reasons        criteria.Reasons
-	AdditionalData map[string]interface{}
+	AdditionalData map[string]any
 }
 
 // NewRuleResult creates a new RuleResult.
@@ -49,7 +51,7 @@ func NewRuleResult(value bool, reasons ...criteria.Reason) RuleResult {
 	return RuleResult{
 		Value:          value,
 		Reasons:        criteria.NewReasons(reasons...),
-		AdditionalData: map[string]interface{}{},
+		AdditionalData: map[string]any{},
 	}
 }
 
@@ -89,26 +91,43 @@ func MergeRuleResultsWithOr(results ...RuleResult) RuleResult {
 
 type policyQuery struct {
 	rego.PreparedEvalQuery
-	checksum string
+	script      string
+	id          string
+	explanation string
+	remediation string
+}
+
+func (q policyQuery) checksum() string {
+	return fmt.Sprintf("%x", cryptutil.Hash("script", []byte(q.script)))
 }
 
 // A PolicyEvaluator evaluates policies.
 type PolicyEvaluator struct {
-	queries []policyQuery
+	queries        []policyQuery
+	policyChecksum uint64
 }
 
 // NewPolicyEvaluator creates a new PolicyEvaluator.
-func NewPolicyEvaluator(ctx context.Context, store *store.Store, configPolicy *config.Policy) (*PolicyEvaluator, error) {
+func NewPolicyEvaluator(
+	ctx context.Context, store *store.Store, configPolicy *config.Policy,
+	addDefaultClientCertificateRule bool,
+) (*PolicyEvaluator, error) {
 	e := new(PolicyEvaluator)
+	e.policyChecksum = configPolicy.Checksum()
 
 	// generate the base rego script for the policy
 	ppl := configPolicy.ToPPL()
+	if addDefaultClientCertificateRule {
+		ppl.AddDefaultClientCertificateRule()
+	}
 	base, err := policy.GenerateRegoFromPolicy(ppl)
 	if err != nil {
 		return nil, err
 	}
 
-	scripts := []string{base}
+	e.queries = []policyQuery{{
+		script: base,
+	}}
 
 	// add any custom rego
 	for _, sp := range configPolicy.SubPolicies {
@@ -117,22 +136,29 @@ func NewPolicyEvaluator(ctx context.Context, store *store.Store, configPolicy *c
 				continue
 			}
 
-			scripts = append(scripts, src)
+			e.queries = append(e.queries, policyQuery{
+				script:      src,
+				id:          sp.ID,
+				explanation: sp.Explanation,
+				remediation: sp.Remediation,
+			})
 		}
 	}
 
 	// for each script, create a rego and prepare a query.
-	for _, script := range scripts {
-		log.Debug(ctx).
-			Str("script", script).
+	for i := range e.queries {
+		log.Ctx(ctx).
+			Trace().
+			Str("script", e.queries[i].script).
 			Str("from", configPolicy.From).
 			Interface("to", configPolicy.To).
 			Msg("authorize: rego script for policy evaluation")
 
 		r := rego.New(
 			rego.Store(store),
-			rego.Module("pomerium.policy", script),
+			rego.Module("pomerium.policy", e.queries[i].script),
 			rego.Query("result = data.pomerium.policy"),
+			rego.EnablePrintStatements(true),
 			getGoogleCloudServerlessHeadersRegoOption,
 			store.GetDataBrokerRecordOption(),
 		)
@@ -142,8 +168,9 @@ func NewPolicyEvaluator(ctx context.Context, store *store.Store, configPolicy *c
 		if err != nil && strings.Contains(err.Error(), "package expected") {
 			r := rego.New(
 				rego.Store(store),
-				rego.Module("pomerium.policy", "package pomerium.policy\n\n"+script),
+				rego.Module("pomerium.policy", "package pomerium.policy\n\n"+e.queries[i].script),
 				rego.Query("result = data.pomerium.policy"),
+				rego.EnablePrintStatements(true),
 				getGoogleCloudServerlessHeadersRegoOption,
 				store.GetDataBrokerRecordOption(),
 			)
@@ -153,10 +180,7 @@ func NewPolicyEvaluator(ctx context.Context, store *store.Store, configPolicy *c
 			return nil, err
 		}
 
-		e.queries = append(e.queries, policyQuery{
-			PreparedEvalQuery: q,
-			checksum:          fmt.Sprintf("%x", cryptutil.Hash("script", []byte(script))),
-		})
+		e.queries[i].PreparedEvalQuery = q
 	}
 
 	return e, nil
@@ -173,16 +197,27 @@ func (e *PolicyEvaluator) Evaluate(ctx context.Context, req *PolicyRequest) (*Po
 		}
 		res.Allow = MergeRuleResultsWithOr(res.Allow, o.Allow)
 		res.Deny = MergeRuleResultsWithOr(res.Deny, o.Deny)
+		res.Traces = append(res.Traces, contextutil.PolicyEvaluationTrace{
+			ID:          query.id,
+			Explanation: query.explanation,
+			Remediation: query.remediation,
+			Allow:       o.Allow.Value,
+			Deny:        o.Deny.Value,
+		})
 	}
 	return res, nil
 }
 
 func (e *PolicyEvaluator) evaluateQuery(ctx context.Context, req *PolicyRequest, query policyQuery) (*PolicyResponse, error) {
-	_, span := trace.StartSpan(ctx, "authorize.PolicyEvaluator.evaluateQuery")
+	ctx, span := trace.StartSpan(ctx, "authorize.PolicyEvaluator.evaluateQuery")
 	defer span.End()
-	span.AddAttributes(octrace.StringAttribute("script_checksum", query.checksum))
+	span.AddAttributes(octrace.StringAttribute("script_checksum", query.checksum()))
 
-	rs, err := safeEval(ctx, query.PreparedEvalQuery, rego.EvalInput(req))
+	rs, err := safeEval(ctx, query.PreparedEvalQuery,
+		rego.EvalInput(req),
+		rego.EvalPrintHook(regoPrintHook{
+			logger: *log.Logger(),
+		}))
 	if err != nil {
 		return nil, fmt.Errorf("authorize: error evaluating policy.rego: %w", err)
 	}
@@ -202,7 +237,7 @@ func (e *PolicyEvaluator) evaluateQuery(ctx context.Context, req *PolicyRequest,
 func (e *PolicyEvaluator) getRuleResult(name string, vars rego.Vars) (result RuleResult) {
 	result = NewRuleResult(false)
 
-	m, ok := vars["result"].(map[string]interface{})
+	m, ok := vars["result"].(map[string]any)
 	if !ok {
 		return result
 	}
@@ -210,10 +245,10 @@ func (e *PolicyEvaluator) getRuleResult(name string, vars rego.Vars) (result Rul
 	switch t := m[name].(type) {
 	case bool:
 		result.Value = t
-	case []interface{}:
+	case []any:
 		switch len(t) {
 		case 3:
-			v, ok := t[2].(map[string]interface{})
+			v, ok := t[2].(map[string]any)
 			if ok {
 				for k, vv := range v {
 					result.AdditionalData[k] = vv
@@ -222,7 +257,7 @@ func (e *PolicyEvaluator) getRuleResult(name string, vars rego.Vars) (result Rul
 			fallthrough
 		case 2:
 			// fill in the reasons
-			v, ok := t[1].([]interface{})
+			v, ok := t[1].([]any)
 			if ok {
 				for _, vv := range v {
 					result.Reasons.Add(criteria.Reason(fmt.Sprint(vv)))

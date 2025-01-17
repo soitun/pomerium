@@ -34,7 +34,7 @@ var (
 			types.Args(types.S, types.S),
 			types.NewObject(nil, types.NewDynamicProperty(types.S, types.S)),
 		),
-	}, func(bctx rego.BuiltinContext, op1 *ast.Term, op2 *ast.Term) (*ast.Term, error) {
+	}, func(_ rego.BuiltinContext, op1 *ast.Term, op2 *ast.Term) (*ast.Term, error) {
 		serviceAccount, ok := op1.Value.(ast.String)
 		if !ok {
 			return nil, fmt.Errorf("invalid service account type: %T", op1)
@@ -47,7 +47,7 @@ var (
 
 		headers, err := getGoogleCloudServerlessHeaders(string(serviceAccount), string(audience))
 		if err != nil {
-			log.Error(context.Background()).Err(err).Msg("error retrieving google cloud serverless headers")
+			log.Error().Err(err).Msg("error retrieving google cloud serverless headers")
 			return nil, fmt.Errorf("failed to get google cloud serverless headers: %w", err)
 		}
 		var kvs [][2]*ast.Term
@@ -65,8 +65,8 @@ type gcpIdentityTokenSource struct {
 }
 
 func (src *gcpIdentityTokenSource) Token() (*oauth2.Token, error) {
-	res, err, _ := src.singleflight.Do("", func() (interface{}, error) {
-		req, err := http.NewRequestWithContext(context.Background(), "GET", GCPIdentityDocURL+"?"+url.Values{
+	res, err, _ := src.singleflight.Do("", func() (any, error) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, GCPIdentityDocURL+"?"+url.Values{
 			"format":   {"full"},
 			"audience": {src.audience},
 		}.Encode(), nil)

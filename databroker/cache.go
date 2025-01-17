@@ -7,50 +7,78 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
+	"time"
 
+	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/pomerium/pomerium/config"
-	"github.com/pomerium/pomerium/internal/directory"
-	"github.com/pomerium/pomerium/internal/envoy/files"
-	"github.com/pomerium/pomerium/internal/identity"
-	"github.com/pomerium/pomerium/internal/identity/manager"
+	"github.com/pomerium/pomerium/internal/atomicutil"
+	"github.com/pomerium/pomerium/internal/events"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/telemetry"
 	"github.com/pomerium/pomerium/internal/version"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
+	"github.com/pomerium/pomerium/pkg/envoy/files"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/grpc/registry"
 	"github.com/pomerium/pomerium/pkg/grpcutil"
+	"github.com/pomerium/pomerium/pkg/identity"
+	"github.com/pomerium/pomerium/pkg/identity/legacymanager"
+	"github.com/pomerium/pomerium/pkg/identity/manager"
 )
 
 // DataBroker represents the databroker service. The databroker service is a simple interface
 // for storing keyed blobs (bytes) of unstructured data.
 type DataBroker struct {
+	Options
 	dataBrokerServer *dataBrokerServer
 	manager          *manager.Manager
+	legacyManager    *legacymanager.Manager
+	eventsMgr        *events.Manager
 
-	localListener                net.Listener
-	localGRPCServer              *grpc.Server
-	localGRPCConnection          *grpc.ClientConn
-	dataBrokerStorageType        string // TODO remove in v0.11
-	deprecatedCacheClusterDomain string // TODO: remove in v0.11
+	localListener       net.Listener
+	localGRPCServer     *grpc.Server
+	localGRPCConnection *grpc.ClientConn
+	sharedKey           *atomicutil.Value[[]byte]
+}
 
-	mu                sync.Mutex
-	directoryProvider directory.Provider
+type Options struct {
+	managerOptions       []manager.Option
+	legacyManagerOptions []legacymanager.Option
+}
+
+type Option func(*Options)
+
+func (o *Options) apply(opts ...Option) {
+	for _, op := range opts {
+		op(o)
+	}
+}
+
+func WithManagerOptions(managerOptions ...manager.Option) Option {
+	return func(o *Options) {
+		o.managerOptions = append(o.managerOptions, managerOptions...)
+	}
+}
+
+func WithLegacyManagerOptions(legacyManagerOptions ...legacymanager.Option) Option {
+	return func(o *Options) {
+		o.legacyManagerOptions = append(o.legacyManagerOptions, legacyManagerOptions...)
+	}
 }
 
 // New creates a new databroker service.
-func New(cfg *config.Config) (*DataBroker, error) {
+func New(ctx context.Context, cfg *config.Config, eventsMgr *events.Manager, opts ...Option) (*DataBroker, error) {
+	options := Options{}
+	options.apply(opts...)
+
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-
-	sharedKey, _ := cfg.Options.GetSharedKey()
 
 	ui, si := grpcutil.AttachMetadataInterceptors(
 		metadata.Pairs(
@@ -62,20 +90,29 @@ func New(cfg *config.Config) (*DataBroker, error) {
 	// No metrics handler because we have one in the control plane.  Add one
 	// if we no longer register with that grpc Server
 	localGRPCServer := grpc.NewServer(
-		grpc.StreamInterceptor(si),
-		grpc.UnaryInterceptor(ui),
+		grpc.ChainStreamInterceptor(log.StreamServerInterceptor(log.Ctx(ctx)), si),
+		grpc.ChainUnaryInterceptor(log.UnaryServerInterceptor(log.Ctx(ctx)), ui),
 	)
 
+	sharedKey, err := cfg.Options.GetSharedKey()
+	if err != nil {
+		return nil, err
+	}
+
+	sharedKeyValue := atomicutil.NewValue(sharedKey)
 	clientStatsHandler := telemetry.NewGRPCClientStatsHandler(cfg.Options.Services)
 	clientDialOptions := []grpc.DialOption{
 		grpc.WithInsecure(),
-		grpc.WithChainUnaryInterceptor(clientStatsHandler.UnaryInterceptor, grpcutil.WithUnarySignedJWT(sharedKey)),
-		grpc.WithChainStreamInterceptor(grpcutil.WithStreamSignedJWT(sharedKey)),
+		grpc.WithChainUnaryInterceptor(clientStatsHandler.UnaryInterceptor, grpcutil.WithUnarySignedJWT(sharedKeyValue.Load)),
+		grpc.WithChainStreamInterceptor(grpcutil.WithStreamSignedJWT(sharedKeyValue.Load)),
 		grpc.WithStatsHandler(clientStatsHandler.Handler),
 	}
 
+	ctx = log.WithContext(ctx, func(c zerolog.Context) zerolog.Context {
+		return c.Str("service", "databroker").Str("config_source", "bootstrap")
+	})
 	localGRPCConnection, err := grpc.DialContext(
-		context.Background(),
+		ctx,
 		localListener.Addr().String(),
 		clientDialOptions...,
 	)
@@ -83,23 +120,23 @@ func New(cfg *config.Config) (*DataBroker, error) {
 		return nil, err
 	}
 
-	dataBrokerServer := newDataBrokerServer(cfg)
-	dataBrokerURLs, err := cfg.Options.GetInternalDataBrokerURLs()
+	dataBrokerServer, err := newDataBrokerServer(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	c := &DataBroker{
-		dataBrokerServer:             dataBrokerServer,
-		localListener:                localListener,
-		localGRPCServer:              localGRPCServer,
-		localGRPCConnection:          localGRPCConnection,
-		deprecatedCacheClusterDomain: dataBrokerURLs[0].Hostname(),
-		dataBrokerStorageType:        cfg.Options.DataBrokerStorageType,
+		Options:             options,
+		dataBrokerServer:    dataBrokerServer,
+		localListener:       localListener,
+		localGRPCServer:     localGRPCServer,
+		localGRPCConnection: localGRPCConnection,
+		sharedKey:           sharedKeyValue,
+		eventsMgr:           eventsMgr,
 	}
 	c.Register(c.localGRPCServer)
 
-	err = c.update(cfg)
+	err = c.update(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -109,9 +146,9 @@ func New(cfg *config.Config) (*DataBroker, error) {
 
 // OnConfigChange is called whenever configuration is changed.
 func (c *DataBroker) OnConfigChange(ctx context.Context, cfg *config.Config) {
-	err := c.update(cfg)
+	err := c.update(ctx, cfg)
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("databroker: error updating configuration")
+		log.Ctx(ctx).Error().Err(err).Msg("databroker: error updating configuration")
 	}
 
 	c.dataBrokerServer.OnConfigChange(ctx, cfg)
@@ -120,7 +157,6 @@ func (c *DataBroker) OnConfigChange(ctx context.Context, cfg *config.Config) {
 // Register registers all the gRPC services with the given server.
 func (c *DataBroker) Register(grpcServer *grpc.Server) {
 	databroker.RegisterDataBrokerServiceServer(grpcServer, c.dataBrokerServer)
-	directory.RegisterDirectoryServiceServer(grpcServer, c)
 	registry.RegisterRegistryServer(grpcServer, c.dataBrokerServer)
 }
 
@@ -128,12 +164,7 @@ func (c *DataBroker) Register(grpcServer *grpc.Server) {
 func (c *DataBroker) Run(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return c.localGRPCServer.Serve(c.localListener)
-	})
-	eg.Go(func() error {
-		<-ctx.Done()
-		c.localGRPCServer.Stop()
-		return nil
+		return grpcutil.ServeWithGracefulStop(ctx, c.localGRPCServer, c.localListener, time.Second*5)
 	})
 	eg.Go(func() error {
 		return c.manager.Run(ctx)
@@ -141,47 +172,57 @@ func (c *DataBroker) Run(ctx context.Context) error {
 	return eg.Wait()
 }
 
-func (c *DataBroker) update(cfg *config.Config) error {
+func (c *DataBroker) update(ctx context.Context, cfg *config.Config) error {
 	if err := validate(cfg.Options); err != nil {
 		return fmt.Errorf("databroker: bad option: %w", err)
 	}
+
+	sharedKey, err := cfg.Options.GetSharedKey()
+	if err != nil {
+		return fmt.Errorf("databroker: invalid shared key: %w", err)
+	}
+	c.sharedKey.Store(sharedKey)
 
 	oauthOptions, err := cfg.Options.GetOauthOptions()
 	if err != nil {
 		return fmt.Errorf("databroker: invalid oauth options: %w", err)
 	}
 
-	authenticator, err := identity.NewAuthenticator(oauthOptions)
-	if err != nil {
-		return fmt.Errorf("databroker: failed to create authenticator: %w", err)
-	}
-
-	directoryProvider := directory.GetProvider(directory.Options{
-		ServiceAccount: cfg.Options.ServiceAccount,
-		Provider:       cfg.Options.Provider,
-		ProviderURL:    cfg.Options.ProviderURL,
-		QPS:            cfg.Options.GetQPS(),
-		ClientID:       cfg.Options.ClientID,
-		ClientSecret:   cfg.Options.ClientSecret,
-	})
-	c.mu.Lock()
-	c.directoryProvider = directoryProvider
-	c.mu.Unlock()
-
 	dataBrokerClient := databroker.NewDataBrokerServiceClient(c.localGRPCConnection)
 
-	options := []manager.Option{
-		manager.WithAuthenticator(authenticator),
-		manager.WithDirectoryProvider(directoryProvider),
+	options := append([]manager.Option{
 		manager.WithDataBrokerClient(dataBrokerClient),
-		manager.WithGroupRefreshInterval(cfg.Options.RefreshDirectoryInterval),
-		manager.WithGroupRefreshTimeout(cfg.Options.RefreshDirectoryTimeout),
+		manager.WithEventManager(c.eventsMgr),
+		manager.WithEnabled(!cfg.Options.IsRuntimeFlagSet(config.RuntimeFlagLegacyIdentityManager)),
+	}, c.managerOptions...)
+	legacyOptions := append([]legacymanager.Option{
+		legacymanager.WithDataBrokerClient(dataBrokerClient),
+		legacymanager.WithEventManager(c.eventsMgr),
+		legacymanager.WithEnabled(cfg.Options.IsRuntimeFlagSet(config.RuntimeFlagLegacyIdentityManager)),
+	}, c.legacyManagerOptions...)
+
+	if cfg.Options.SupportsUserRefresh() {
+		authenticator, err := identity.NewAuthenticator(oauthOptions)
+		if err != nil {
+			log.Ctx(ctx).Error().Err(err).Msg("databroker: failed to create authenticator")
+		} else {
+			options = append(options, manager.WithAuthenticator(authenticator))
+			legacyOptions = append(legacyOptions, legacymanager.WithAuthenticator(authenticator))
+		}
+	} else {
+		log.Ctx(ctx).Info().Msg("databroker: disabling refresh of user sessions")
 	}
 
 	if c.manager == nil {
 		c.manager = manager.New(options...)
 	} else {
 		c.manager.UpdateConfig(options...)
+	}
+
+	if c.legacyManager == nil {
+		c.legacyManager = legacymanager.New(legacyOptions...)
+	} else {
+		c.legacyManager.UpdateConfig(legacyOptions...)
 	}
 
 	return nil

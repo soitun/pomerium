@@ -2,7 +2,7 @@
 set -euo pipefail
 
 _dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-_protoc_version="3.14.0"
+_protoc_version="21.7"
 _protoc_path="/tmp/pomerium-protoc/protoc-$_protoc_version"
 _protoc_3pp_path="/tmp/pomerium-protoc-3pp"
 _os="linux"
@@ -50,6 +50,7 @@ exec "$_protoc_path/bin/protoc" \
   -I "$_protoc_3pp_path/googleapis" \
   --experimental_allow_proto3_optional \
   --plugin="protoc-gen-go=$_dir/protoc-gen-go" \
+  --plugin="protoc-gen-go-grpc=$_dir/protoc-gen-go-grpc" \
   --plugin="protoc-gen-grpc-web=$_dir/protoc-gen-grpc-web" \
   --plugin="protoc-gen-validate=$_dir/protoc-gen-validate" \
   "$@"

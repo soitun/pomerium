@@ -38,6 +38,7 @@ local KubernetesDeployment(name, image, environment) =
             ports: [
               { name: 'http', containerPort: 80 },
               { name: 'https', containerPort: 443 },
+              { name: 'quic', containerPort: 443, protocol: 'UDP' },
               { name: 'grpc', containerPort: 5443 },
             ],
             env: [
@@ -68,21 +69,24 @@ local KubernetesService(name) =
       ports: [
         { name: 'http', port: 80, targetPort: 'http', nodePort: 80 },
         { name: 'https', port: 443, targetPort: 'https', nodePort: 443 },
+        { name: 'quic', port: 443, targetPort: 'quic', nodePort: 443, protocol: 'UDP' },
         { name: 'grpc', port: 5443, targetPort: 'grpc', nodePort: 5443 },
       ],
     },
   };
 
 
-local Environment(mode, idp, dns_suffix) =
+local Environment(mode, idp, authentication_flow, dns_suffix) =
   {
     AUTHENTICATE_SERVICE_URL: 'https://authenticate.localhost.pomerium.io',
     CERTIFICATE: std.base64(importstr '../files/trusted.pem'),
     CERTIFICATE_KEY: std.base64(importstr '../files/trusted-key.pem'),
     CERTIFICATE_AUTHORITY: std.base64(importstr '../files/ca.pem'),
+    CODEC_TYPE: 'http3',
     COOKIE_SECRET: 'UYgnt8bxxK5G2sFaNzyqi5Z+OgF8m2akNc0xdQx718w=',
-    DATABROKER_STORAGE_TYPE: 'redis',
-    DATABROKER_STORAGE_CONNECTION_STRING: 'redis://redis:6379',
+    DATABROKER_STORAGE_TYPE: 'postgres',
+    DATABROKER_STORAGE_CONNECTION_STRING: 'postgres://pomerium:password@postgres:5432/test',
+    DOWNSTREAM_MTLS_CRL: std.base64(importstr '../files/downstream-crl.pem'),
     ENVOY_ADMIN_ADDRESS: '0.0.0.0:9901',
     GOOGLE_CLOUD_SERVERLESS_AUTHENTICATION_SERVICE_ACCOUNT: std.base64(std.manifestJsonEx(
       GoogleCloudServerlessAuthenticationServiceAccount(dns_suffix), ''
@@ -94,22 +98,23 @@ local Environment(mode, idp, dns_suffix) =
     JWT_CLAIMS_HEADERS: 'email,groups,user',
     LOG_LEVEL: 'info',
     POLICY: std.base64(std.manifestJsonEx(Routes(mode, idp, dns_suffix), '')),
+    RUNTIME_FLAGS: '{"pomerium_jwt_endpoint": true}',
     SHARED_SECRET: 'UYgnt8bxxK5G2sFaNzyqi5Z+OgF8m2akNc0xdQx718w=',
     SIGNING_KEY: std.base64(importstr '../files/signing-key.pem'),
     SIGNING_KEY_ALGORITHM: 'ES256',
-  } + if mode == 'multi' then {
-    AUTHENTICATE_INTERNAL_SERVICE_URL: 'https://pomerium-authenticate',
-    AUTHORIZE_SERVICE_URL: 'https://pomerium-authorize:5443',
-    DATABROKER_SERVICE_URL: 'https://pomerium-databroker:5443',
-    GRPC_ADDRESS: ':5443',
-    GRPC_INSECURE: 'false',
-  } else if mode == 'traefik' then {
-    FORWARD_AUTH_URL: 'https://forward-authenticate.localhost.pomerium.io',
-  } else if mode == 'nginx' then {
-    ADDRESS: ':80',
-    INSECURE_SERVER: 'true',
-    FORWARD_AUTH_URL: 'https://forward-authenticate.localhost.pomerium.io',
-  } else {};
+  } + (
+    if mode == 'multi' then {
+      AUTHENTICATE_INTERNAL_SERVICE_URL: 'https://pomerium-authenticate',
+      AUTHORIZE_SERVICE_URL: 'https://pomerium-authorize:5443',
+      DATABROKER_SERVICE_URL: 'https://pomerium-databroker:5443',
+      GRPC_ADDRESS: ':5443',
+      GRPC_INSECURE: 'false',
+    } else {}
+  ) + (
+    if authentication_flow == 'stateless' then {
+      DEBUG_FORCE_AUTHENTICATE_FLOW: 'stateless',
+    } else {}
+  );
 
 local ComposeService(name, definition, additionalAliases=[]) =
   utils.ComposeService(name, definition {
@@ -120,7 +125,7 @@ local ComposeService(name, definition, additionalAliases=[]) =
       for name in [
         'fortio',
         'mock-idp',
-        'redis',
+        'postgres',
         'trusted-httpdetails',
         'trusted-1-httpdetails',
         'trusted-2-httpdetails',
@@ -133,10 +138,10 @@ local ComposeService(name, definition, additionalAliases=[]) =
     },
   }, additionalAliases);
 
-function(mode, idp, dns_suffix='') {
+function(mode, idp, authentication_flow, dns_suffix='') {
   local name = 'pomerium',
-  local image = 'pomerium/pomerium:${POMERIUM_TAG:-master}',
-  local environment = Environment(mode, idp, dns_suffix),
+  local image = 'pomerium/pomerium:${POMERIUM_TAG:-main}',
+  local environment = Environment(mode, idp, authentication_flow, dns_suffix),
 
   compose: {
     services: if mode == 'multi' then
@@ -182,27 +187,11 @@ function(mode, idp, dns_suffix='') {
         ports: [
           '80:80/tcp',
           '443:443/tcp',
+          '443:443/udp',
           '5443:5443/tcp',
           '9901:9901/tcp',
         ],
       }, ['mock-idp.localhost.pomerium.io'])
-    else if mode == 'traefik' || mode == 'nginx' then
-      ComposeService(name, {
-        image: image,
-        environment: environment,
-      }, ['authenticate.localhost.pomerium.io', 'forward-authenticate.localhost.pomerium.io']) +
-      ComposeService(name + '-ready', {
-        image: 'jwilder/dockerize:0.6.1',
-        command: [
-          '-wait',
-          if mode == 'nginx' then
-            'http://' + name + ':80/healthz'
-          else
-            'https://' + name + ':443/healthz',
-          '-timeout',
-          '10m',
-        ],
-      })
     else
       ComposeService(name, {
         image: image,
@@ -210,6 +199,7 @@ function(mode, idp, dns_suffix='') {
         ports: [
           '80:80/tcp',
           '443:443/tcp',
+          '443:443/udp',
           '9901:9901/tcp',
         ],
       }, ['authenticate.localhost.pomerium.io']),

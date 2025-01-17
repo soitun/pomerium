@@ -4,6 +4,8 @@ package inmemory
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,12 +13,14 @@ import (
 	"github.com/google/btree"
 	"github.com/rs/zerolog"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/signal"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
+	"github.com/pomerium/pomerium/pkg/health"
 	"github.com/pomerium/pomerium/pkg/storage"
 )
 
@@ -83,6 +87,9 @@ func New(options ...Option) *Backend {
 			}
 		}()
 	}
+
+	health.ReportOK(health.StorageBackend, health.StrAttr("backend", "in-memory"))
+
 	return backend
 }
 
@@ -128,18 +135,25 @@ func (backend *Backend) Close() error {
 func (backend *Backend) Get(_ context.Context, recordType, id string) (*databroker.Record, error) {
 	backend.mu.RLock()
 	defer backend.mu.RUnlock()
+	if record := backend.get(recordType, id); record != nil {
+		return record, nil
+	}
+	return nil, storage.ErrNotFound
+}
 
+// get gets a record from the in-memory store, assuming the RWMutex is held.
+func (backend *Backend) get(recordType, id string) *databroker.Record {
 	records := backend.lookup[recordType]
 	if records == nil {
-		return nil, storage.ErrNotFound
+		return nil
 	}
 
 	record := records.Get(id)
 	if record == nil {
-		return nil, storage.ErrNotFound
+		return nil
 	}
 
-	return dup(record), nil
+	return dup(record)
 }
 
 // GetOptions returns the options for a type in the in-memory store.
@@ -186,6 +200,15 @@ func (backend *Backend) Lease(_ context.Context, leaseName, leaseID string, ttl 
 	return true, nil
 }
 
+// ListTypes lists the record types.
+func (backend *Backend) ListTypes(_ context.Context) ([]string, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	keys := slices.Sorted(maps.Keys(backend.lookup))
+
+	return keys, nil
+}
+
 // Put puts a record into the in-memory store.
 func (backend *Backend) Put(ctx context.Context, records []*databroker.Record) (serverVersion uint64, err error) {
 	backend.mu.Lock()
@@ -204,19 +227,7 @@ func (backend *Backend) Put(ctx context.Context, records []*databroker.Record) (
 				Str("db_type", record.Type)
 		})
 
-		backend.recordChange(record)
-
-		c, ok := backend.lookup[record.GetType()]
-		if !ok {
-			c = NewRecordCollection()
-			backend.lookup[record.GetType()] = c
-		}
-
-		if record.GetDeletedAt() != nil {
-			c.Delete(record.GetId())
-		} else {
-			c.Put(dup(record))
-		}
+		backend.update(record)
 
 		recordTypes[record.GetType()] = struct{}{}
 	}
@@ -225,6 +236,68 @@ func (backend *Backend) Put(ctx context.Context, records []*databroker.Record) (
 	}
 
 	return backend.serverVersion, nil
+}
+
+// update stores a record into the in-memory store, assuming the RWMutex is held.
+func (backend *Backend) update(record *databroker.Record) {
+	backend.recordChange(record)
+
+	c, ok := backend.lookup[record.GetType()]
+	if !ok {
+		c = NewRecordCollection()
+		backend.lookup[record.GetType()] = c
+	}
+
+	if record.GetDeletedAt() != nil {
+		c.Delete(record.GetId())
+	} else {
+		c.Put(dup(record))
+	}
+}
+
+// Patch updates the specified fields of existing record(s).
+func (backend *Backend) Patch(
+	ctx context.Context, records []*databroker.Record, fields *fieldmaskpb.FieldMask,
+) (serverVersion uint64, patchedRecords []*databroker.Record, err error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	defer backend.onChange.Broadcast(ctx)
+
+	serverVersion = backend.serverVersion
+	patchedRecords = make([]*databroker.Record, 0, len(records))
+
+	for _, record := range records {
+		err = backend.patch(record, fields)
+		if storage.IsNotFound(err) {
+			// Skip any record that does not currently exist.
+			continue
+		} else if err != nil {
+			return serverVersion, patchedRecords, err
+		}
+		patchedRecords = append(patchedRecords, record)
+	}
+
+	return serverVersion, patchedRecords, nil
+}
+
+// patch updates the specified fields of an existing record, assuming the RWMutex is held.
+func (backend *Backend) patch(record *databroker.Record, fields *fieldmaskpb.FieldMask) error {
+	if record == nil {
+		return fmt.Errorf("cannot patch using a nil record")
+	}
+
+	existing := backend.get(record.GetType(), record.GetId())
+	if existing == nil {
+		return storage.ErrNotFound
+	}
+
+	if err := storage.PatchRecord(existing, record, fields); err != nil {
+		return err
+	}
+
+	backend.update(record)
+
+	return nil
 }
 
 // SetOptions sets the options for a type in the in-memory store.
@@ -243,7 +316,7 @@ func (backend *Backend) SetOptions(_ context.Context, recordType string, options
 }
 
 // Sync returns a record stream for any changes after recordVersion.
-func (backend *Backend) Sync(ctx context.Context, serverVersion, recordVersion uint64) (storage.RecordStream, error) {
+func (backend *Backend) Sync(ctx context.Context, recordType string, serverVersion, recordVersion uint64) (storage.RecordStream, error) {
 	backend.mu.RLock()
 	currentServerVersion := backend.serverVersion
 	backend.mu.RUnlock()
@@ -251,16 +324,22 @@ func (backend *Backend) Sync(ctx context.Context, serverVersion, recordVersion u
 	if serverVersion != currentServerVersion {
 		return nil, storage.ErrInvalidServerVersion
 	}
-	return newSyncRecordStream(ctx, backend, recordVersion), nil
+	return newSyncRecordStream(ctx, backend, recordType, recordVersion), nil
 }
 
 // SyncLatest returns a record stream for all the records.
-func (backend *Backend) SyncLatest(ctx context.Context) (serverVersion uint64, stream storage.RecordStream, err error) {
+func (backend *Backend) SyncLatest(
+	ctx context.Context,
+	recordType string,
+	expr storage.FilterExpression,
+) (serverVersion, recordVersion uint64, stream storage.RecordStream, err error) {
 	backend.mu.RLock()
-	currentServerVersion := backend.serverVersion
+	serverVersion = backend.serverVersion
+	recordVersion = backend.lastVersion
 	backend.mu.RUnlock()
 
-	return currentServerVersion, newSyncLatestRecordStream(ctx, backend), nil
+	stream, err = newSyncLatestRecordStream(ctx, backend, recordType, expr)
+	return serverVersion, recordVersion, stream, err
 }
 
 func (backend *Backend) recordChange(record *databroker.Record) {
@@ -298,7 +377,7 @@ func (backend *Backend) enforceCapacity(recordType string) {
 	}
 }
 
-func (backend *Backend) getSince(version uint64) []*databroker.Record {
+func (backend *Backend) getSince(recordType string, version uint64) []*databroker.Record {
 	backend.mu.RLock()
 	defer backend.mu.RUnlock()
 
@@ -316,6 +395,16 @@ func (backend *Backend) getSince(version uint64) []*databroker.Record {
 		}
 		return true
 	})
+
+	if recordType != "" {
+		var filtered []*databroker.Record
+		for _, record := range records {
+			if record.GetType() == recordType {
+				filtered = append(filtered, record)
+			}
+		}
+		records = filtered
+	}
 	return records
 }
 

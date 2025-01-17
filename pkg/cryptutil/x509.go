@@ -30,7 +30,7 @@ type (
 )
 
 // MarshalPKCS8PrivateKey wraps x509.MarshalPKCS8PrivateKey with added support for KeyEncryptionKeys.
-func MarshalPKCS8PrivateKey(key interface{}) ([]byte, error) {
+func MarshalPKCS8PrivateKey(key any) ([]byte, error) {
 	// also support a pointer to a private key encryption key
 	if kek, ok := key.(*PrivateKeyEncryptionKey); ok {
 		key = *kek
@@ -42,7 +42,7 @@ func MarshalPKCS8PrivateKey(key interface{}) ([]byte, error) {
 		}
 		curvePrivateKey, err := asn1.Marshal(kek.KeyBytes())
 		if err != nil {
-			return nil, fmt.Errorf("cryptutil: failed to marshal private key: %v", err)
+			return nil, fmt.Errorf("cryptutil: failed to marshal private key: %w", err)
 		}
 		privKey.PrivateKey = curvePrivateKey
 		return asn1.Marshal(privKey)
@@ -53,7 +53,7 @@ func MarshalPKCS8PrivateKey(key interface{}) ([]byte, error) {
 }
 
 // MarshalPKIXPublicKey wraps x509.MarshalPKIXPublicKey with added support for KeyEncryptionKeys.
-func MarshalPKIXPublicKey(pub interface{}) ([]byte, error) {
+func MarshalPKIXPublicKey(pub any) ([]byte, error) {
 	if kek, ok := pub.(*PublicKeyEncryptionKey); ok {
 		pub = *kek
 	}
@@ -76,7 +76,7 @@ func MarshalPKIXPublicKey(pub interface{}) ([]byte, error) {
 }
 
 // ParsePKCS8PrivateKey wraps x509.ParsePKCS8PrivateKey with added support for KeyEncryptionKeys.
-func ParsePKCS8PrivateKey(der []byte) (interface{}, error) {
+func ParsePKCS8PrivateKey(der []byte) (any, error) {
 	var privKey pkcs8
 	_, err := asn1.Unmarshal(der, &privKey)
 	if err != nil {
@@ -86,7 +86,7 @@ func ParsePKCS8PrivateKey(der []byte) (interface{}, error) {
 	if privKey.Algo.Algorithm.Equal(oidPublicKeyX25519) {
 		var bs []byte
 		if _, err := asn1.Unmarshal(privKey.PrivateKey, &bs); err != nil {
-			return nil, fmt.Errorf("cryptutil: invalid X25519 private key: %v", err)
+			return nil, fmt.Errorf("cryptutil: invalid X25519 private key: %w", err)
 		}
 		return NewPrivateKeyEncryptionKey(bs)
 	}
@@ -96,7 +96,7 @@ func ParsePKCS8PrivateKey(der []byte) (interface{}, error) {
 }
 
 // ParsePKIXPublicKey wraps x509.ParsePKIXPublicKey with added support for KeyEncryptionKeys.
-func ParsePKIXPublicKey(derBytes []byte) (pub interface{}, err error) {
+func ParsePKIXPublicKey(derBytes []byte) (pub any, err error) {
 	var pki publicKeyInfo
 	rest, err := asn1.Unmarshal(derBytes, &pki)
 	if err != nil || len(rest) > 0 {

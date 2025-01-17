@@ -14,29 +14,39 @@ import (
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/types"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/policy/generator"
 	"github.com/pomerium/pomerium/pkg/policy/parser"
 	"github.com/pomerium/pomerium/pkg/protoutil"
 )
 
-type A = []interface{}
-type M = map[string]interface{}
+type (
+	A = []any
+	M = map[string]any
+)
 
 var testingNow = time.Date(2021, 5, 11, 13, 43, 0, 0, time.Local)
 
 type (
 	Input struct {
-		HTTP    InputHTTP    `json:"http"`
-		Session InputSession `json:"session"`
+		HTTP                     InputHTTP    `json:"http"`
+		Session                  InputSession `json:"session"`
+		IsValidClientCertificate bool         `json:"is_valid_client_certificate"`
 	}
 	InputHTTP struct {
-		Method  string              `json:"method"`
-		Path    string              `json:"path"`
-		Headers map[string][]string `json:"headers"`
+		Method            string                `json:"method"`
+		Path              string                `json:"path"`
+		Headers           map[string][]string   `json:"headers"`
+		ClientCertificate ClientCertificateInfo `json:"client_certificate"`
 	}
 	InputSession struct {
 		ID string `json:"id"`
+	}
+	ClientCertificateInfo struct {
+		Presented bool   `json:"presented"`
+		Leaf      string `json:"leaf"`
 	}
 )
 
@@ -63,14 +73,33 @@ func generateRegoFromYAML(raw string) (string, error) {
 	return string(bs), nil
 }
 
-type dataBrokerRecord interface {
+func makeRecord(object interface {
 	proto.Message
 	GetId() string
+},
+) *databroker.Record {
+	a := protoutil.NewAny(object)
+	return &databroker.Record{
+		Type:       a.GetTypeUrl(),
+		Id:         object.GetId(),
+		Data:       a,
+		ModifiedAt: timestamppb.Now(),
+	}
+}
+
+func makeStructRecord(recordType, recordID string, object any) *databroker.Record {
+	s := protoutil.ToStruct(object).GetStructValue()
+	return &databroker.Record{
+		Type:       recordType,
+		Id:         recordID,
+		Data:       protoutil.NewAny(s),
+		ModifiedAt: timestamppb.Now(),
+	}
 }
 
 func evaluate(t *testing.T,
 	rawPolicy string,
-	dataBrokerRecords []dataBrokerRecord,
+	dataBrokerRecords []*databroker.Record,
 	input Input,
 ) (rego.Vars, error) {
 	regoPolicy, err := generateRegoFromYAML(rawPolicy)
@@ -86,7 +115,7 @@ func evaluate(t *testing.T,
 			Decl: types.NewFunction([]types.Type{
 				types.S, types.S,
 			}, types.A),
-		}, func(bctx rego.BuiltinContext, op1, op2 *ast.Term) (*ast.Term, error) {
+		}, func(_ rego.BuiltinContext, op1, op2 *ast.Term) (*ast.Term, error) {
 			recordType, ok := op1.Value.(ast.String)
 			if !ok {
 				return nil, fmt.Errorf("invalid type for record_type: %T", op1)
@@ -98,10 +127,10 @@ func evaluate(t *testing.T,
 			}
 
 			for _, record := range dataBrokerRecords {
-				any := protoutil.NewAny(record)
-				if string(recordType) == any.GetTypeUrl() &&
+				if string(recordType) == record.GetType() &&
 					string(recordID) == record.GetId() {
-					bs, _ := json.Marshal(record)
+					msg, _ := record.GetData().UnmarshalNew()
+					bs, _ := json.Marshal(msg)
 					v, err := ast.ValueFromReader(bytes.NewReader(bs))
 					if err != nil {
 						return nil, err
@@ -113,6 +142,7 @@ func evaluate(t *testing.T,
 			return nil, nil
 		}),
 		rego.Input(input),
+		rego.SetRegoVersion(ast.RegoV1),
 	)
 	preparedQuery, err := r.PrepareForEval(context.Background())
 	if err != nil {
@@ -129,7 +159,7 @@ func evaluate(t *testing.T,
 	if len(resultSet) == 0 {
 		return make(rego.Vars), nil
 	}
-	vars, ok := resultSet[0].Bindings["result"].(map[string]interface{})
+	vars, ok := resultSet[0].Bindings["result"].(map[string]any)
 	if !ok {
 		return make(rego.Vars), nil
 	}

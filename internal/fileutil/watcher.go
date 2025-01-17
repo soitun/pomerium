@@ -4,8 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/rjeczalik/notify"
-	"github.com/rs/zerolog"
+	"namespacelabs.dev/go-filenotify"
 
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/signal"
@@ -14,59 +13,93 @@ import (
 // A Watcher watches files for changes.
 type Watcher struct {
 	*signal.Signal
-	mu        sync.Mutex
-	filePaths map[string]chan notify.EventInfo
+
+	mu             sync.Mutex
+	watching       map[string]struct{}
+	pollingWatcher filenotify.FileWatcher
 }
 
 // NewWatcher creates a new Watcher.
 func NewWatcher() *Watcher {
 	return &Watcher{
-		Signal:    signal.New(),
-		filePaths: map[string]chan notify.EventInfo{},
+		Signal:   signal.New(),
+		watching: make(map[string]struct{}),
 	}
 }
 
-// Add adds a new watch.
-func (watcher *Watcher) Add(filePath string) {
+// Watch updates the watched file paths.
+func (watcher *Watcher) Watch(ctx context.Context, filePaths []string) {
 	watcher.mu.Lock()
 	defer watcher.mu.Unlock()
 
-	ctx := log.WithContext(context.TODO(), func(c zerolog.Context) zerolog.Context {
-		return c.Str("watch_file", filePath)
-	})
+	watcher.initLocked(ctx)
 
-	// already watching
-	if _, ok := watcher.filePaths[filePath]; ok {
+	var add []string
+	seen := map[string]struct{}{}
+	for _, filePath := range filePaths {
+		if _, ok := watcher.watching[filePath]; !ok {
+			add = append(add, filePath)
+		}
+		seen[filePath] = struct{}{}
+	}
+
+	var remove []string
+	for filePath := range watcher.watching {
+		if _, ok := seen[filePath]; !ok {
+			remove = append(remove, filePath)
+		}
+	}
+
+	for _, filePath := range add {
+		watcher.watching[filePath] = struct{}{}
+
+		if watcher.pollingWatcher != nil {
+			err := watcher.pollingWatcher.Add(filePath)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).Str("file", filePath).Msg("fileutil/watcher: failed to add file to polling-based file watcher")
+			}
+		}
+	}
+
+	for _, filePath := range remove {
+		delete(watcher.watching, filePath)
+
+		if watcher.pollingWatcher != nil {
+			err := watcher.pollingWatcher.Remove(filePath)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).Str("file", filePath).Msg("fileutil/watcher: failed to remove file from polling-based file watcher")
+			}
+		}
+	}
+}
+
+func (watcher *Watcher) initLocked(ctx context.Context) {
+	if watcher.pollingWatcher != nil {
 		return
 	}
 
-	ch := make(chan notify.EventInfo, 1)
+	if watcher.pollingWatcher == nil {
+		watcher.pollingWatcher = filenotify.NewPollingWatcher(nil)
+		context.AfterFunc(ctx, func() {
+			watcher.pollingWatcher.Close()
+		})
+	}
+
+	errors := watcher.pollingWatcher.Errors()
+	events := watcher.pollingWatcher.Events()
+
+	// log errors
 	go func() {
-		for evt := range ch {
-			log.Info(ctx).Str("event", evt.Event().String()).Msg("filemgr: detected file change")
-			watcher.Signal.Broadcast(ctx)
+		for err := range errors {
+			log.Ctx(ctx).Error().Err(err).Msg("fileutil/watcher: file notification error")
 		}
 	}()
-	err := notify.Watch(filePath, ch, notify.All)
-	if err != nil {
-		log.Error(ctx).Err(err).Msg("filemgr: error watching file path")
-		notify.Stop(ch)
-		close(ch)
-		return
-	}
-	log.Debug(ctx).Msg("filemgr: watching file for changes")
 
-	watcher.filePaths[filePath] = ch
-}
-
-// Clear removes all watches.
-func (watcher *Watcher) Clear() {
-	watcher.mu.Lock()
-	defer watcher.mu.Unlock()
-
-	for filePath, ch := range watcher.filePaths {
-		notify.Stop(ch)
-		close(ch)
-		delete(watcher.filePaths, filePath)
-	}
+	// handle events
+	go func() {
+		for evt := range events {
+			log.Ctx(ctx).Info().Str("name", evt.Name).Str("op", evt.Op.String()).Msg("fileutil/watcher: file notification event")
+			watcher.Broadcast(ctx)
+		}
+	}()
 }

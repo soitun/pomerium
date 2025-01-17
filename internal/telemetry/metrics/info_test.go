@@ -6,12 +6,12 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/pomerium/pomerium/internal/version"
-	"github.com/pomerium/pomerium/pkg/metrics"
-
 	"go.opencensus.io/metric/metricdata"
 	"go.opencensus.io/metric/metricproducer"
 	"go.opencensus.io/stats/view"
+
+	"github.com/pomerium/pomerium/internal/version"
+	"github.com/pomerium/pomerium/pkg/metrics"
 )
 
 func Test_SetConfigInfo(t *testing.T) {
@@ -65,7 +65,7 @@ func Test_SetDBConfigInfo(t *testing.T) {
 }
 
 func Test_SetBuildInfo(t *testing.T) {
-	registry = newMetricRegistry()
+	initTemporaryMetricsRegistry(t)
 
 	version.Version = "v0.0.1"
 	version.GitCommit = "deadbeef"
@@ -84,7 +84,7 @@ func Test_SetBuildInfo(t *testing.T) {
 }
 
 func Test_AddPolicyCountCallback(t *testing.T) {
-	registry = newMetricRegistry()
+	initTemporaryMetricsRegistry(t)
 
 	wantValue := int64(42)
 	wantLabels := []metricdata.LabelValue{
@@ -105,4 +105,10 @@ func Test_RegisterInfoMetrics(t *testing.T) {
 	if len(r) != 2 {
 		t.Error("Did not find enough registries")
 	}
+}
+
+func initTemporaryMetricsRegistry(t *testing.T) {
+	original := registry
+	registry = newMetricRegistry()
+	t.Cleanup(func() { registry = original })
 }

@@ -6,12 +6,14 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	internal_databroker "github.com/pomerium/pomerium/internal/databroker"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
@@ -27,9 +29,8 @@ var lis *bufconn.Listener
 func init() {
 	lis = bufconn.Listen(bufSize)
 	s := grpc.NewServer()
-	internalSrv := internal_databroker.New()
-	srv := &dataBrokerServer{server: internalSrv}
-	srv.sharedKey.Store([]byte{})
+	internalSrv := internal_databroker.New(context.Background())
+	srv := &dataBrokerServer{server: internalSrv, sharedKey: atomicutil.NewValue([]byte{})}
 	databroker.RegisterDataBrokerServiceServer(s, srv)
 
 	go func() {
@@ -49,7 +50,7 @@ func TestServerSync(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 	c := databroker.NewDataBrokerServiceClient(conn)
-	any := protoutil.NewAny(new(user.User))
+	data := protoutil.NewAny(new(user.User))
 	numRecords := 200
 
 	var serverVersion uint64
@@ -57,16 +58,16 @@ func TestServerSync(t *testing.T) {
 	for i := 0; i < numRecords; i++ {
 		res, err := c.Put(ctx, &databroker.PutRequest{
 			Records: []*databroker.Record{{
-				Type: any.TypeUrl,
+				Type: data.TypeUrl,
 				Id:   strconv.Itoa(i),
-				Data: any,
+				Data: data,
 			}},
 		})
 		require.NoError(t, err)
 		serverVersion = res.GetServerVersion()
 	}
 
-	t.Run("Sync ok", func(t *testing.T) {
+	t.Run("Sync ok", func(_ *testing.T) {
 		client, _ := c.Sync(ctx, &databroker.SyncRequest{
 			ServerVersion: serverVersion,
 		})
@@ -89,7 +90,7 @@ func TestServerSync(t *testing.T) {
 		require.NoError(t, err)
 		_, err = client.Recv()
 		require.Error(t, err)
-		require.Equal(t, codes.Aborted, status.Code(err))
+		assert.Equal(t, codes.Aborted.String(), status.Code(err).String())
 	})
 }
 
@@ -101,15 +102,15 @@ func BenchmarkSync(b *testing.B) {
 	}
 	defer conn.Close()
 	c := databroker.NewDataBrokerServiceClient(conn)
-	any := protoutil.NewAny(new(session.Session))
+	data := protoutil.NewAny(new(session.Session))
 	numRecords := 10000
 
 	for i := 0; i < numRecords; i++ {
 		_, _ = c.Put(ctx, &databroker.PutRequest{
 			Records: []*databroker.Record{{
-				Type: any.TypeUrl,
+				Type: data.TypeUrl,
 				Id:   strconv.Itoa(i),
-				Data: any,
+				Data: data,
 			}},
 		})
 	}

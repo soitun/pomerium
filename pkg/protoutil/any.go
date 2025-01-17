@@ -1,13 +1,14 @@
 package protoutil
 
 import (
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // ToAny converts any type into an any value.
-func ToAny(value interface{}) *anypb.Any {
+func ToAny(value any) *anypb.Any {
 	switch v := value.(type) {
 	case bool:
 		return NewAnyBool(v)
@@ -56,6 +57,19 @@ func NewAny(msg proto.Message) *anypb.Any {
 		return NewAnyNull()
 	}
 	return a
+}
+
+// UnmarshalAnyJSON unmarshals JSON data into Any
+func UnmarshalAnyJSON(data []byte) (*anypb.Any, error) {
+	opts := protojson.UnmarshalOptions{
+		AllowPartial:   true,
+		DiscardUnknown: true,
+	}
+	var val anypb.Any
+	if err := opts.Unmarshal(data, &val); err != nil {
+		return nil, err
+	}
+	return &val, nil
 }
 
 // NewAnyBool creates a new any type from a bool.

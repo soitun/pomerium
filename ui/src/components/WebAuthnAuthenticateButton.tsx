@@ -1,4 +1,4 @@
-import React, { FC, useRef, useState } from "react";
+import React, { FC } from "react";
 
 import { WebAuthnRequestOptions } from "../types";
 import { decode, encodeUrl } from "../util/base64";
@@ -28,6 +28,7 @@ async function authenticateCredential(
       challenge: decode(requestOptions?.challenge),
       timeout: requestOptions?.timeout,
       userVerification: requestOptions?.userVerification,
+      rpId: requestOptions?.rpId,
     },
   });
   return credential as CredentialForAuthenticate;

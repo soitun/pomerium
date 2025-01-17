@@ -1,12 +1,38 @@
 version: 2
 updates:
-  - package-ecosystem: "gomod"
+  - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "weekly"
-    labels:
-      - "dependency"
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      docker:
+        patterns:
+          - "*"
+  - package-ecosystem: "docker"
+    directory: "/.github/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      docker:
+        patterns:
+          - "*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      go:
+        patterns:
+          - "*"

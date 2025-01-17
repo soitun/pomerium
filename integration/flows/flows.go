@@ -13,16 +13,14 @@ import (
 	"time"
 
 	"github.com/pomerium/pomerium/integration/forms"
-	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/urlutil"
 )
 
 const (
-	authenticateHostname        = "authenticate.localhost.pomerium.io"
-	forwardAuthenticateHostname = "forward-authenticate.localhost.pomerium.io"
-	idpHostname                 = "mock-idp.localhost.pomerium.io"
-	pomeriumCallbackPath        = "/.pomerium/callback/"
-	pomeriumAPIPath             = "/.pomerium/api/v1/login"
+	authenticateHostname = "authenticate.localhost.pomerium.io"
+	idpHostname          = "mock-idp.localhost.pomerium.io"
+	pomeriumCallbackPath = "/.pomerium/callback/"
+	pomeriumAPIPath      = "/.pomerium/api/v1/login"
 )
 
 type authenticateConfig struct {
@@ -30,7 +28,7 @@ type authenticateConfig struct {
 	groups          []string
 	tokenExpiration time.Duration
 	apiPath         string
-	forwardAuth     bool
+	requestHeaders  http.Header
 }
 
 // An AuthenticateOption is an option for authentication.
@@ -39,6 +37,7 @@ type AuthenticateOption func(cfg *authenticateConfig)
 func getAuthenticateConfig(options ...AuthenticateOption) *authenticateConfig {
 	cfg := &authenticateConfig{
 		tokenExpiration: time.Hour * 24,
+		requestHeaders:  http.Header{},
 	}
 	for _, option := range options {
 		if option != nil {
@@ -46,13 +45,6 @@ func getAuthenticateConfig(options ...AuthenticateOption) *authenticateConfig {
 		}
 	}
 	return cfg
-}
-
-// WithForwardAuth enables/disables forward auth.
-func WithForwardAuth(fa bool) AuthenticateOption {
-	return func(cfg *authenticateConfig) {
-		cfg.forwardAuth = fa
-	}
 }
 
 // WithEmail sets the email to use.
@@ -83,6 +75,12 @@ func WithAPI() AuthenticateOption {
 	}
 }
 
+func WithRequestHeader(name, value string) AuthenticateOption {
+	return func(cfg *authenticateConfig) {
+		cfg.requestHeaders.Set(name, value)
+	}
+}
+
 // Authenticate submits a request to a URL, expects a redirect to authenticate and then openid and logs in.
 // Finally it expects to redirect back to the original page.
 func Authenticate(ctx context.Context, client *http.Client, url *url.URL, options ...AuthenticateOption) (*http.Response, error) {
@@ -102,27 +100,28 @@ func Authenticate(ctx context.Context, client *http.Client, url *url.URL, option
 		apiLogin.RawQuery = q.Encode()
 
 		apiLogin.Path = cfg.apiPath
-		req, err := http.NewRequestWithContext(ctx, "GET", apiLogin.String(), nil)
-		req.Header.Set("Accept", "application/json")
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiLogin.String(), nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("via-api: invalid request: %w", err)
 		}
+		req.Header.Set("Accept", "application/json")
+
 		res, err := client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("via-api: error making request: %w", err)
 		}
 		defer res.Body.Close()
 		bodyBytes, err := io.ReadAll(res.Body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("via-api: error reading response body: %w", err)
 		}
 		url, err = url.Parse(string(bodyBytes))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("via-api: error parsing response body: %w", err)
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +143,7 @@ func Authenticate(ctx context.Context, client *http.Client, url *url.URL, option
 	}
 
 	// (2) redirect to idp
-	for req.URL.Hostname() == authenticateHostname || req.URL.Hostname() == forwardAuthenticateHostname {
+	for req.URL.Hostname() == authenticateHostname {
 		res, err = client.Do(req)
 		if err != nil {
 			return nil, err
@@ -177,6 +176,7 @@ func Authenticate(ctx context.Context, client *http.Client, url *url.URL, option
 			if err != nil {
 				return nil, err
 			}
+			addRequestHeaders(req, cfg.requestHeaders)
 		} else {
 			req, err = requestFromRedirectResponse(ctx, res, req)
 			if err != nil {
@@ -200,32 +200,8 @@ func Authenticate(ctx context.Context, client *http.Client, url *url.URL, option
 	}
 
 	// (5) finally to callback
-	if !cfg.forwardAuth && req.URL.Path != pomeriumCallbackPath {
+	if req.URL.Path != pomeriumCallbackPath {
 		return nil, fmt.Errorf("expected to redirect 5 back to %s, but got %s", pomeriumCallbackPath, req.URL.String())
-	}
-
-	if cfg.forwardAuth {
-		for i := 0; ; i++ {
-			res, err = client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer res.Body.Close()
-			if res.StatusCode != 302 {
-				break
-			}
-			originalURL := req.URL.String()
-			req, err = requestFromRedirectResponse(ctx, res, req)
-			if err != nil {
-				return nil, fmt.Errorf("expected redirect to %s: %w", originalHostname, err)
-			}
-			log.Info(ctx).
-				Int("count", i).
-				Str("from", originalURL).
-				Str("to", req.URL.String()).
-				Msg("forward-auth redirect")
-		}
-		return res, err
 	}
 
 	res, err = client.Do(req)
@@ -267,9 +243,16 @@ func requestFromRedirectResponse(ctx context.Context, res *http.Response, req *h
 		return nil, fmt.Errorf("error parsing location: %w", err)
 	}
 	location = req.URL.ResolveReference(location)
-	newreq, err := http.NewRequestWithContext(ctx, "GET", location.String(), nil)
+	newreq, err := http.NewRequestWithContext(ctx, http.MethodGet, location.String(), nil)
 	if err != nil {
 		return nil, err
 	}
+	addRequestHeaders(newreq, req.Header)
 	return newreq, nil
+}
+
+func addRequestHeaders(req *http.Request, headers http.Header) {
+	for h := range headers {
+		req.Header[h] = headers[h]
+	}
 }

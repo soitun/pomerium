@@ -2,7 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	mathrand "math/rand/v2"
 	"net/url"
+	"strings"
 	"testing"
 
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -12,6 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/pomerium/pomerium/internal/urlutil"
+	"github.com/pomerium/pomerium/pkg/cryptutil"
 )
 
 func Test_PolicyValidate(t *testing.T) {
@@ -47,9 +51,11 @@ func Test_PolicyValidate(t *testing.T) {
 		{"bad key file", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://httpbin.corp.notatld"), TLSClientCertFile: "testdata/example-cert.pem", TLSClientKeyFile: "testdata/example-key-404.pem"}, true},
 		{"good tls server name", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://internal-host-name"), TLSServerName: "httpbin.corp.notatld"}, false},
 		{"good kube service account token file", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://internal-host-name"), KubernetesServiceAccountTokenFile: "testdata/kubeserviceaccount.token"}, false},
-		{"bad kube service account token file", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://internal-host-name"), KubernetesServiceAccountTokenFile: "testdata/missing.token"}, true},
 		{"good kube service account token", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://internal-host-name"), KubernetesServiceAccountToken: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJPbmxpbmUgSldUIEJ1aWxkZXIiLCJpYXQiOjE1OTY1MDk4MjIsImV4cCI6MTYyODA0NTgyMiwiYXVkIjoid3d3LmV4YW1wbGUuY29tIiwic3ViIjoianJvY2tldEBleGFtcGxlLmNvbSIsIkdpdmVuTmFtZSI6IkpvaG5ueSIsIlN1cm5hbWUiOiJSb2NrZXQiLCJFbWFpbCI6Impyb2NrZXRAZXhhbXBsZS5jb20iLCJSb2xlIjpbIk1hbmFnZXIiLCJQcm9qZWN0IEFkbWluaXN0cmF0b3IiXX0.H0I6ccQrL6sKobsKQj9dqNcLw_INhU9_xJsVyCkgkiY"}, false},
 		{"bad kube service account token and file", Policy{From: "https://httpbin.corp.example", To: mustParseWeightedURLs(t, "https://internal-host-name"), KubernetesServiceAccountToken: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJPbmxpbmUgSldUIEJ1aWxkZXIiLCJpYXQiOjE1OTY1MDk4MjIsImV4cCI6MTYyODA0NTgyMiwiYXVkIjoid3d3LmV4YW1wbGUuY29tIiwic3ViIjoianJvY2tldEBleGFtcGxlLmNvbSIsIkdpdmVuTmFtZSI6IkpvaG5ueSIsIlN1cm5hbWUiOiJSb2NrZXQiLCJFbWFpbCI6Impyb2NrZXRAZXhhbXBsZS5jb20iLCJSb2xlIjpbIk1hbmFnZXIiLCJQcm9qZWN0IEFkbWluaXN0cmF0b3IiXX0.H0I6ccQrL6sKobsKQj9dqNcLw_INhU9_xJsVyCkgkiY", KubernetesServiceAccountTokenFile: "testdata/kubeserviceaccount.token"}, true},
+		{"TCP To URLs", Policy{From: "tcp+https://httpbin.corp.example:4000", To: mustParseWeightedURLs(t, "tcp://one.example.com:5000", "tcp://two.example.com:5000")}, false},
+		{"mix of TCP and non-TCP To URLs", Policy{From: "tcp+https://httpbin.corp.example:4000", To: mustParseWeightedURLs(t, "https://example.com", "tcp://example.com:5000")}, true},
+		{"UDP To URLs", Policy{From: "udp+https://httpbin.corp.example:4000", To: mustParseWeightedURLs(t, "udp://one.example.com:5000", "udp://two.example.com:5000")}, false},
 	}
 
 	for _, tt := range tests {
@@ -57,6 +63,52 @@ func Test_PolicyValidate(t *testing.T) {
 			err := tt.policy.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func Test_PolicyValidate_RedirectResponseCode(t *testing.T) {
+	t.Parallel()
+
+	var r PolicyRedirect
+	p := Policy{
+		From:     "http://example.com",
+		Redirect: &r,
+	}
+
+	cases := []struct {
+		Code          *int32
+		ExpectedError string
+	}{
+		{nil, ""},
+		{proto.Int32(0), "unsupported redirect response code 0"},
+		{proto.Int32(100), "unsupported redirect response code 100"},
+		{proto.Int32(200), "unsupported redirect response code 200"},
+		{proto.Int32(300), "unsupported redirect response code 300"},
+		{proto.Int32(301), ""},
+		{proto.Int32(302), ""},
+		{proto.Int32(303), ""},
+		{proto.Int32(304), "unsupported redirect response code 304"},
+		{proto.Int32(305), "unsupported redirect response code 305"},
+		{proto.Int32(306), "unsupported redirect response code 306"},
+		{proto.Int32(307), ""},
+		{proto.Int32(308), ""},
+		{proto.Int32(309), "unsupported redirect response code 309"},
+		{proto.Int32(400), "unsupported redirect response code 400"},
+		{proto.Int32(500), "unsupported redirect response code 500"},
+		{proto.Int32(600), "unsupported redirect response code 600"},
+	}
+
+	for i := range cases {
+		c := &cases[i]
+		t.Run(fmt.Sprint(c.Code), func(t *testing.T) {
+			r.ResponseCode = c.Code
+			err := p.Validate()
+			if c.ExpectedError != "" {
+				assert.ErrorContains(t, err, c.ExpectedError)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -84,7 +136,7 @@ func TestPolicy_String(t *testing.T) {
 			if got := p.String(); got != tt.want {
 				t.Errorf("Policy.String() = %v, want %v", got, tt.want)
 			}
-			out, err := json.Marshal(p.Source)
+			out, err := json.Marshal(p.From)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -106,7 +158,7 @@ func Test_PolicyRouteID(t *testing.T) {
 		{
 			"same",
 			&Policy{From: "https://pomerium.io", To: mustParseWeightedURLs(t, "http://localhost"), AllowedUsers: []string{"foo@bar.com"}},
-			&Policy{From: "https://pomerium.io", To: mustParseWeightedURLs(t, "http://localhost"), AllowedGroups: []string{"allusers"}},
+			&Policy{From: "https://pomerium.io", To: mustParseWeightedURLs(t, "http://localhost")},
 			true,
 		},
 		{
@@ -166,6 +218,9 @@ func TestPolicy_FromToPb(t *testing.T) {
 
 	t.Run("normal", func(t *testing.T) {
 		p := &Policy{
+			Name:         "ROUTE_NAME",
+			Description:  "DESCRIPTION",
+			LogoURL:      "LOGO_URL",
 			From:         "https://pomerium.io",
 			To:           mustParseWeightedURLs(t, "http://localhost"),
 			AllowedUsers: []string{"foo@bar.com"},
@@ -183,6 +238,9 @@ func TestPolicy_FromToPb(t *testing.T) {
 
 		policyFromPb, err := NewPolicyFromProto(pbPolicy)
 		assert.NoError(t, err)
+		assert.Equal(t, p.Name, policyFromPb.Name)
+		assert.Equal(t, p.Description, policyFromPb.Description)
+		assert.Equal(t, p.LogoURL, policyFromPb.LogoURL)
 		assert.Equal(t, p.From, policyFromPb.From)
 		assert.Equal(t, p.To, policyFromPb.To)
 		assert.Equal(t, p.AllowedUsers, policyFromPb.AllowedUsers)
@@ -245,7 +303,7 @@ func TestPolicy_Matches(t *testing.T) {
 		}
 		assert.NoError(t, p.Validate())
 
-		assert.False(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/foo/bar`)),
+		assert.False(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/foo/bar`), true),
 			"regex should only match full string")
 	})
 	t.Run("issue2952", func(t *testing.T) {
@@ -256,7 +314,7 @@ func TestPolicy_Matches(t *testing.T) {
 		}
 		assert.NoError(t, p.Validate())
 
-		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/foo/bar/0`)))
+		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/foo/bar/0`), true))
 	})
 	t.Run("issue2592-test2", func(t *testing.T) {
 		p := &Policy{
@@ -266,7 +324,299 @@ func TestPolicy_Matches(t *testing.T) {
 		}
 		assert.NoError(t, p.Validate())
 
-		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/admin/foo`)))
-		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/admin/bar`)))
+		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/admin/foo`), true))
+		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://www.example.com/admin/bar`), true))
 	})
+	t.Run("tcp", func(t *testing.T) {
+		p := &Policy{
+			From: "tcp+https://proxy.example.com/tcp.example.com:6379",
+			To:   mustParseWeightedURLs(t, "tcp://localhost:6379"),
+		}
+		assert.NoError(t, p.Validate())
+
+		assert.True(t, p.Matches(urlutil.MustParseAndValidateURL(`https://tcp.example.com:6379`), true))
+	})
+}
+
+func TestPolicy_SortOrder(t *testing.T) {
+	ptr := func(i int64) *int64 {
+		return &i
+	}
+
+	testCases := []struct {
+		name     string
+		policies []Policy
+		wantIDs  []string
+	}{
+		{
+			name: "regexPriorityOrder DESC NULLS LAST",
+			policies: []Policy{
+				{From: "a", Path: "/a", RegexPriorityOrder: nil, ID: "3"},
+				{From: "a", Path: "/a", RegexPriorityOrder: ptr(2), ID: "2"},
+				{From: "a", Path: "/a", RegexPriorityOrder: ptr(1), ID: "1"},
+			},
+			wantIDs: []string{"2", "1", "3"},
+		},
+		{
+			name: "from ASC",
+			policies: []Policy{
+				{From: "", Path: "", RegexPriorityOrder: nil, ID: "B"},
+				{From: "", Path: "", RegexPriorityOrder: ptr(0), ID: "C"},
+				{From: "source", Path: "/a", RegexPriorityOrder: ptr(1), ID: "A"},
+			},
+			wantIDs: []string{"C", "B", "A"},
+		},
+		{
+			name: "id ASC",
+			policies: []Policy{
+				{From: "source", Path: "/a", RegexPriorityOrder: ptr(1), Regex: "regex", Prefix: "prefix", ID: "2"},
+				{From: "source", Path: "/a", RegexPriorityOrder: ptr(1), Regex: "regex", Prefix: "prefix", ID: "1"},
+			},
+			wantIDs: []string{"1", "2"},
+		},
+		{
+			name: "path DESC",
+			policies: []Policy{
+				{From: "source", Path: "/b", RegexPriorityOrder: ptr(1), ID: "3"},
+				{From: "source", Path: "/a", RegexPriorityOrder: nil, ID: "2"},
+				{From: "source", Path: "/a", RegexPriorityOrder: ptr(2), ID: "1"},
+			},
+			wantIDs: []string{"3", "1", "2"},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			SortPolicies(tt.policies)
+
+			gotIDs := make([]string, 0, len(tt.policies))
+			for _, entity := range tt.policies {
+				gotIDs = append(gotIDs, entity.ID)
+			}
+
+			assert.Equal(t, tt.wantIDs, gotIDs)
+		})
+	}
+}
+
+func TestPolicy_IsTCP(t *testing.T) {
+	p1 := Policy{From: "https://example.com"}
+	assert.False(t, p1.IsTCP())
+
+	p2 := Policy{From: "tcp+https://example.com"}
+	assert.True(t, p2.IsTCP())
+}
+
+func TestPolicy_IsTCPUpstream(t *testing.T) {
+	p1 := Policy{
+		From: "tcp+https://example.com:1234",
+		To:   mustParseWeightedURLs(t, "https://one.example.com", "https://two.example.com"),
+	}
+	assert.False(t, p1.IsTCPUpstream())
+
+	p2 := Policy{
+		From: "tcp+https://example.com:1234",
+		To:   mustParseWeightedURLs(t, "tcp://one.example.com:4000", "tcp://two.example.com:4000"),
+	}
+	assert.True(t, p2.IsTCPUpstream())
+
+	p3 := Policy{
+		From: "tcp+https://example.com:1234",
+	}
+	assert.False(t, p3.IsTCPUpstream())
+}
+
+func mustParseWeightedURLs(t testing.TB, urls ...string) []WeightedURL {
+	wu, err := ParseWeightedUrls(urls...)
+	require.NoError(t, err)
+	return wu
+}
+
+func TestRouteID(t *testing.T) {
+	randomString := func() string {
+		return strings.TrimSuffix(cryptutil.NewRandomStringN(mathrand.IntN(31)+1), "=")
+	}
+	randomBool := func() bool {
+		return mathrand.N(2) == 0
+	}
+	randomURL := func() *url.URL {
+		u, err := url.Parse(fmt.Sprintf("https://%s.example.com/%s?foo=%s#%s",
+			randomString(), randomString(), randomString(), randomString()))
+		require.NoError(t, err)
+		return u
+	}
+	baseFieldMutators := []func(p *Policy){
+		func(p *Policy) { p.From = randomString() },
+		func(p *Policy) { p.Prefix = randomString() },
+		func(p *Policy) { p.Path = randomString() },
+		func(p *Policy) { p.Regex = randomString() },
+	}
+	toMutators := func(p *Policy) {
+		p.To = make(WeightedURLs, mathrand.N(9)+1)
+		for i := 0; i < len(p.To); i++ {
+			p.To[i] = WeightedURL{URL: *randomURL(), LbWeight: mathrand.Uint32()}
+		}
+	}
+	redirectMutators := []func(p *PolicyRedirect){
+		func(p *PolicyRedirect) { p.HTTPSRedirect = randomPtr(10, randomBool()) },
+		func(p *PolicyRedirect) { p.SchemeRedirect = randomPtr(10, randomString()) },
+		func(p *PolicyRedirect) { p.HostRedirect = randomPtr(10, randomString()) },
+		func(p *PolicyRedirect) { p.PortRedirect = randomPtr(10, mathrand.Uint32()) },
+		func(p *PolicyRedirect) { p.PathRedirect = randomPtr(10, randomString()) },
+		func(p *PolicyRedirect) { p.PrefixRewrite = randomPtr(10, randomString()) },
+		func(p *PolicyRedirect) { p.ResponseCode = randomPtr(10, mathrand.Int32()) },
+		func(p *PolicyRedirect) { p.StripQuery = randomPtr(10, randomBool()) },
+	}
+	responseMutators := []func(p *DirectResponse){
+		func(p *DirectResponse) { p.Status = mathrand.Int() },
+		func(p *DirectResponse) { p.Body = randomString() },
+	}
+
+	t.Run("random policies", func(t *testing.T) {
+		hashes := make(map[uint64]struct{}, 10000)
+		for i := 0; i < 10000; i++ {
+			p := Policy{}
+			for _, m := range baseFieldMutators {
+				m(&p)
+			}
+			switch mathrand.IntN(3) {
+			case 0:
+				toMutators(&p)
+			case 1:
+				p.Redirect = &PolicyRedirect{}
+				for _, m := range redirectMutators {
+					m(p.Redirect)
+				}
+			case 2:
+				p.Response = &DirectResponse{}
+				for _, m := range responseMutators {
+					m(p.Response)
+				}
+			}
+
+			routeID, err := p.RouteID()
+			require.NoError(t, err)
+			hashes[routeID] = struct{}{} // odds of a collision should be pretty low here
+
+			// check that computing the route id again results in the same value
+			routeID2, err := p.RouteID()
+			require.NoError(t, err)
+			assert.Equal(t, routeID, routeID2)
+		}
+		assert.Len(t, hashes, 10000)
+	})
+	t.Run("incremental policy", func(t *testing.T) {
+		hashes := make(map[uint64]Policy, 5000)
+
+		p := Policy{}
+
+		checkAdd := func(p *Policy) {
+			routeID, err := p.RouteID()
+			require.NoError(t, err)
+			if existing, ok := hashes[routeID]; ok {
+				require.Equal(t, existing, *p)
+			} else {
+				hashes[routeID] = *p
+			}
+
+			// check that computing the route id again results in the same value
+			routeID2, err := p.RouteID()
+			require.NoError(t, err)
+			assert.Equal(t, routeID, routeID2)
+		}
+
+		// to
+		toMutators(&p)
+		checkAdd(&p)
+
+		// set base fields
+		for _, m := range baseFieldMutators {
+			m(&p)
+			checkAdd(&p)
+		}
+
+		// redirect
+		p.To = nil
+		p.Redirect = &PolicyRedirect{}
+		for range 1000 {
+			for _, m := range redirectMutators {
+				m(p.Redirect)
+				checkAdd(&p)
+			}
+		}
+
+		// update base fields
+		for _, m := range baseFieldMutators {
+			m(&p)
+			checkAdd(&p)
+		}
+
+		// direct response
+		p.Redirect = nil
+		p.Response = &DirectResponse{}
+		for range 1000 {
+			for _, m := range responseMutators {
+				m(p.Response)
+				checkAdd(&p)
+			}
+		}
+
+		// update base fields
+		for _, m := range baseFieldMutators {
+			m(&p)
+			checkAdd(&p)
+		}
+
+		// sanity check
+		assert.Greater(t, len(hashes), 2000)
+	})
+	t.Run("field separation", func(t *testing.T) {
+		cases := []struct {
+			a, b *Policy
+		}{
+			{
+				&Policy{From: "foo", Prefix: "bar"},
+				&Policy{From: "f", Prefix: "oobar"},
+			},
+			{
+				&Policy{From: "foo", Prefix: "bar"},
+				&Policy{From: "foobar", Prefix: ""},
+			},
+			{
+				&Policy{From: "foobar", Prefix: ""},
+				&Policy{From: "", Prefix: "foobar"},
+			},
+			{
+				&Policy{From: "foo", Prefix: "", Path: "bar"},
+				&Policy{From: "foo", Prefix: "bar", Path: ""},
+			},
+			{
+				&Policy{From: "", Prefix: "foo", Path: "bar"},
+				&Policy{From: "foo", Prefix: "bar", Path: ""},
+			},
+			{
+				&Policy{From: "", Prefix: "foo", Path: "bar"},
+				&Policy{From: "foo", Prefix: "", Path: "bar"},
+			},
+		}
+		for _, c := range cases {
+			c.a.To = mustParseWeightedURLs(t, "https://foo")
+			c.b.To = mustParseWeightedURLs(t, "https://foo")
+		}
+
+		for _, c := range cases {
+			a, err := c.a.RouteID()
+			require.NoError(t, err)
+			b, err := c.b.RouteID()
+			require.NoError(t, err)
+			assert.NotEqual(t, a, b)
+		}
+	})
+}
+
+func randomPtr[T any](nilChance int, t T) *T {
+	if mathrand.N(nilChance) == 0 {
+		return nil
+	}
+	return &t
 }

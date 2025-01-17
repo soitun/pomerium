@@ -15,18 +15,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # pin@v3
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@8b122486cedac8393e77aa9734c3528886e4a1a8 # pin@v1
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@dc7b9719a96d48369863986a06765841d7ea23f6 # pin@v1
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349
 
       - name: Login to DockerHub
-        uses: docker/login-action@49ed152c8eca782a232dede0303416e8f356c37b # pin@v1
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -40,14 +38,14 @@ jobs:
           TAGS=${TAGS},${IMAGE}:master
           TAGS=${TAGS},${IMAGE}:${SHA_TAG}
           TS=$(date +%Y%m%d%H%M%S)
-          echo ::set-output name=tags::${TAGS}
-          echo ::set-output name=timestamp::${TS}
-          echo ::set-output name=name::pomerium
-          echo ::set-output name=image::${IMAGE}
-          echo ::set-output name=sha-tag::${SHA_TAG}
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "timestamp=${TS}" >> $GITHUB_OUTPUT
+          echo "name=pomerium" >> $GITHUB_OUTPUT
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "sha-tag=${SHA_TAG}" >> $GITHUB_OUTPUT
 
       - name: Docker Publish - Main
-        uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8 # pin@v2
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355
         with:
           context: .
           file: ./Dockerfile
@@ -60,7 +58,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Docker Publish - Debug
-        uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8 # pin@v2
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355
         with:
           context: .
           file: ./Dockerfile.debug
@@ -77,25 +75,20 @@ jobs:
     needs: publish
     steps:
       - name: Checkout Gitops Repo
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # pin@v3
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: pomerium/gitops-argocd
           token: ${{ secrets.APPARITOR_GITHUB_TOKEN }}
 
       - name: Bump psql environment
-        uses: mikefarah/yq@1425d0720ec16e51172b88c871ac85f56bcd8ae3 # pin@v4.23.1
+        uses: mikefarah/yq@bc5b54cb1d1f720db16c9f75c5b45384d00e5cbf
         with:
-          cmd: yq eval '.pomerium.image.tag = "${{ needs.publish.outputs.sha-tag }}"' -i
+          cmd:
+            yq eval '.pomerium.image.tag = "${{ needs.publish.outputs.sha-tag }}"' -i
             projects/pomerium-master-postgres/pomerium/values.yaml
 
-      - name: Bump mysql environment
-        uses: mikefarah/yq@1425d0720ec16e51172b88c871ac85f56bcd8ae3 # pin@v4.23.1
-        with:
-          cmd: yq eval '.pomerium.image.tag = "${{ needs.publish.outputs.sha-tag }}"' -i
-            projects/pomerium-master-mysql/pomerium/values.yaml
-
       - name: Commit changes
-        uses: stefanzweifel/git-auto-commit-action@49620cd3ed21ee620a48530e81dba0d139c9cb80 # pin@v4
+        uses: stefanzweifel/git-auto-commit-action@8621497c8c39c72f3e2a999a26b4ca1b5058a842
         with:
           commit_message: |
             Bump test environment pomerium/pomerium

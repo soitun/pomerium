@@ -19,8 +19,9 @@ func TestHTTPError_ErrorResponse(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		{"404 json", http.StatusNotFound, errors.New("route not known"), "application/json", http.StatusNotFound, "{\"Status\":404,\"Error\":\"Not Found: route not known\"}\n"},
+		{"404 json", http.StatusNotFound, errors.New("route not known"), "application/json", http.StatusNotFound, "{\"Status\":404}\n"},
 		{"404 html", http.StatusNotFound, errors.New("route not known"), "", http.StatusNotFound, ""},
+		{"302 found", http.StatusFound, errors.New("redirect"), "", http.StatusFound, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -28,7 +29,7 @@ func TestHTTPError_ErrorResponse(t *testing.T) {
 				err := NewError(tt.Status, tt.Err)
 				var e *HTTPError
 				if errors.As(err, &e) {
-					e.ErrorResponse(w, r)
+					e.ErrorResponse(r.Context(), w, r)
 				} else {
 					http.Error(w, "coulnd't convert error type", http.StatusTeapot)
 				}

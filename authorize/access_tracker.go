@@ -2,11 +2,13 @@ package authorize
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/pomerium/pomerium/internal/log"
@@ -58,45 +60,41 @@ func (tracker *AccessTracker) Run(ctx context.Context) {
 	ticker := time.NewTicker(tracker.debouncePeriod)
 	defer ticker.Stop()
 
-	sessionAccesses := sets.NewSizeLimitedStringSet(tracker.maxSize)
-	serviceAccountAccesses := sets.NewSizeLimitedStringSet(tracker.maxSize)
+	sessionAccesses := sets.NewSizeLimited[string](tracker.maxSize)
+	serviceAccountAccesses := sets.NewSizeLimited[string](tracker.maxSize)
 	runTrackSessionAccess := func(sessionID string) {
-		sessionAccesses.Add(sessionID)
+		sessionAccesses.Insert(sessionID)
 	}
 	runTrackServiceAccountAccess := func(serviceAccountID string) {
-		serviceAccountAccesses.Add(serviceAccountID)
+		serviceAccountAccesses.Insert(serviceAccountID)
 	}
 	runSubmit := func() {
 		if dropped := atomic.SwapInt64(&tracker.droppedAccesses, 0); dropped > 0 {
-			log.Error(ctx).
+			log.Ctx(ctx).Error().
 				Int64("dropped", dropped).
 				Msg("authorize: failed to track all session accesses")
 		}
 
 		client := tracker.provider.GetDataBrokerServiceClient()
 
-		var err error
-
-		sessionAccesses.ForEach(func(sessionID string) bool {
-			err = tracker.updateSession(ctx, client, sessionID)
-			return err == nil
-		})
-		if err != nil {
-			log.Error(ctx).Err(err).Msg("authorize: error updating session last access timestamp")
-			return
+		for sessionID := range sessionAccesses.Items() {
+			err := tracker.updateSession(ctx, client, sessionID)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).Msg("authorize: error updating session last access timestamp")
+				return
+			}
 		}
 
-		serviceAccountAccesses.ForEach(func(serviceAccountID string) bool {
-			err = tracker.updateServiceAccount(ctx, client, serviceAccountID)
-			return err == nil
-		})
-		if err != nil {
-			log.Error(ctx).Err(err).Msg("authorize: error updating service account last access timestamp")
-			return
+		for serviceAccountID := range serviceAccountAccesses.Items() {
+			err := tracker.updateServiceAccount(ctx, client, serviceAccountID)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).Msg("authorize: error updating service account last access timestamp")
+				return
+			}
 		}
 
-		sessionAccesses = sets.NewSizeLimitedStringSet(tracker.maxSize)
-		serviceAccountAccesses = sets.NewSizeLimitedStringSet(tracker.maxSize)
+		sessionAccesses = sets.NewSizeLimited[string](tracker.maxSize)
+		serviceAccountAccesses = sets.NewSizeLimited[string](tracker.maxSize)
 	}
 
 	for {
@@ -158,13 +156,12 @@ func (tracker *AccessTracker) updateSession(
 	ctx, clearTimeout := context.WithTimeout(ctx, accessTrackerUpdateTimeout)
 	defer clearTimeout()
 
-	s, err := session.Get(ctx, client, sessionID)
-	if status.Code(err) == codes.NotFound {
-		return nil
-	} else if err != nil {
-		return err
+	s := &session.Session{Id: sessionID, AccessedAt: timestamppb.Now()}
+	m, err := fieldmaskpb.New(s, "accessed_at")
+	if err != nil {
+		return fmt.Errorf("internal error: %w", err)
 	}
-	s.AccessedAt = timestamppb.Now()
-	_, err = session.Put(ctx, client, s)
+
+	_, err = session.Patch(ctx, client, s, m)
 	return err
 }

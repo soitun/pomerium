@@ -1,31 +1,100 @@
-import { ErrorPageData } from "../types";
-import SectionFooter from "./SectionFooter";
-import Alert from "@mui/material/Alert";
-import AlertTitle from "@mui/material/AlertTitle";
-import Box from "@mui/material/Box";
-import Container from "@mui/material/Container";
-import Paper from "@mui/material/Paper";
-import Stack from "@mui/material/Stack";
-import Typography from "@mui/material/Typography";
+import {
+  Alert,
+  AlertTitle,
+  Box,
+  Container,
+  ListItemProps,
+  Paper,
+  Stack,
+  Table,
+  TableCell,
+  TableHead,
+  TableRow,
+  Typography,
+} from "@mui/material";
+import Markdown from "markdown-to-jsx";
 import React, { FC } from "react";
+import { CheckCircle, MinusCircle, XCircle } from "react-feather";
+
+import { ErrorPageData, PolicyEvaluationTrace } from "../types";
+import SectionFooter from "./SectionFooter";
+
+type PolicyEvaluationTraceDetailsProps = {
+  trace: PolicyEvaluationTrace;
+} & ListItemProps;
+const PolicyEvaluationTraceDetails: FC<PolicyEvaluationTraceDetailsProps> = ({
+  trace,
+}) => {
+  return (
+    <TableRow>
+      <TableCell align={"center"}>
+        {trace.deny ? (
+          <XCircle color="red" />
+        ) : trace.allow ? (
+          <CheckCircle color="green" />
+        ) : (
+          <MinusCircle color="gray" />
+        )}
+      </TableCell>
+      <TableCell>
+        <Markdown>{trace.explanation || `Policy ID ${trace.id}`}</Markdown>
+      </TableCell>
+      <TableCell>
+        <Markdown>
+          {trace.deny || !trace.allow ? trace.remediation : ""}
+        </Markdown>
+      </TableCell>
+    </TableRow>
+  );
+};
 
 export type ErrorPageProps = {
   data: ErrorPageData;
 };
 export const ErrorPage: FC<ErrorPageProps> = ({ data }) => {
+  const traces =
+    data?.policyEvaluationTraces?.filter((trace) => !!trace.id) || [];
+  const status = data?.status || 500;
+
   return (
     <Container maxWidth={false}>
       <Paper sx={{ overflow: "hidden" }}>
         <Stack>
           <Box sx={{ padding: "16px" }}>
-            <Alert severity="error">
+            <Alert
+              severity={status < 200 || status >= 300 ? "error" : "success"}
+            >
               <AlertTitle>
-                {data?.status || 500}{" "}
-                {data?.statusText || "Internal Server Error"}
+                {status} {data?.statusText || "Internal Server Error"}
               </AlertTitle>
-              {data?.error || "Internal Server Error"}
+              {data?.description ? (
+                <Markdown>{data.description}</Markdown>
+              ) : (
+                <></>
+              )}
             </Alert>
           </Box>
+          {!!data?.errorMessageFirstParagraph && (
+            <Box sx={{ p: 4 }}>
+              <Markdown>{data.errorMessageFirstParagraph}</Markdown>
+            </Box>
+          )}
+          {traces?.length > 0 && (
+            <Container>
+              <Table>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Outcome</TableCell>
+                    <TableCell>Explanation</TableCell>
+                    <TableCell>Remediation</TableCell>
+                  </TableRow>
+                </TableHead>
+                {traces.map((trace) => (
+                  <PolicyEvaluationTraceDetails trace={trace} key={trace.id} />
+                ))}
+              </Table>
+            </Container>
+          )}
           {data?.requestId ? (
             <SectionFooter>
               <Typography variant="caption">

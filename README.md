@@ -1,26 +1,29 @@
-<a href="https://pomerium.io" title="Pomerium is a zero trust, context and identity aware access proxy."><img src="https://www.pomerium.com/wp-content/uploads/2021/08/Pomerium-H-white-bg.png" height="70" alt="pomerium logo"></a>
+<a href="https://pomerium.com" title="Pomerium is a zero trust, context and identity aware access proxy."><img src="./.github/logo.png" height="138" alt="pomerium logo"></a>
 
-[![pomerium chat](https://img.shields.io/badge/chat-on%20slack-blue.svg?style=flat&logo=slack)](http://slack.pomerium.io)
-[![GitHub Actions](https://img.shields.io/github/workflow/status/pomerium/pomerium/Release?style=flat)](https://github.com/pomerium/pomerium/actions?query=workflow%3ARelease)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pomerium/pomerium)](https://goreportcard.com/report/github.com/pomerium/pomerium)
 [![GoDoc](https://godoc.org/github.com/pomerium/pomerium?status.svg)][godocs]
 [![LICENSE](https://img.shields.io/github/license/pomerium/pomerium.svg)](https://github.com/pomerium/pomerium/blob/main/LICENSE)
 ![Docker Pulls](https://img.shields.io/docker/pulls/pomerium/pomerium)
 
-Pomerium is an identity-aware proxy that enables secure access to internal applications. Pomerium provides a standardized interface to add access control to applications regardless of whether the application itself has authorization or authentication baked-in. Pomerium gateways both internal and external requests, and can be used in situations where you'd typically reach for a VPN.
+Pomerium builds secure, clientless connections to internal web apps and services without a corporate VPN.
 
-Pomerium can be used to:
+Pomerium is:
 
-- provide a **single-sign-on gateway** to internal applications.
-- enforce **dynamic access policy** based on **context**, **identity**, and **device identity**.
-- aggregate access logs and telemetry data.
-- a **VPN alternative**.
+- **Easier** with [clientless access](https://www.pomerium.com/clientless-access).
+- **Faster** by being [tunnel-free and deployed where your apps and services are](https://www.pomerium.com/vpn-replacement).
+- **Safer** because [every single action is verified](https://www.pomerium.com/continuous-verification-auditing) before allowed to execute.
+- **Tailored** to your organization’s needs by integrating all data for [context-aware access](https://www.pomerium.com/context-aware-access).
+
+It’s not a VPN alternative – it’s the trusted, foolproof way to protect your business. Want a hosted control plane and management GUI? [Give Pomerium Zero a try today](https://console.pomerium.app/create-account?utm_source=github&utm_medium=readme&utm_campaign=github)!
 
 ## Docs
 
 For comprehensive docs, and tutorials see our [documentation].
 
-[documentation]: https://pomerium.com/docs/
-[go environment]: https://golang.org/doc/install
-[godocs]: https://godoc.org/github.com/pomerium/pomerium
-[quick start guide]: https://www.pomerium.io/guide/
+## Contributing
+
+See [Contributing] for information on how you can contribute to Pomerium.
+
+[contributing]: https://www.pomerium.com/docs/community/contributing
+[documentation]: https://www.pomerium.com/docs/
+[godocs]: https://pkg.go.dev/github.com/pomerium/pomerium

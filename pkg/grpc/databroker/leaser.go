@@ -59,7 +59,6 @@ func NewLeasers(leaseName string, ttl time.Duration, client DataBrokerServiceCli
 //
 // 1. ctx is canceled
 // 2. a non-cancel error is returned from handler
-//
 func (locker *Leaser) Run(ctx context.Context) error {
 	retryTicker := time.NewTicker(locker.ttl / 2)
 	defer retryTicker.Stop()
@@ -72,13 +71,13 @@ func (locker *Leaser) Run(ctx context.Context) error {
 		case err == nil:
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-retryTicker.C:
 			}
 		case errors.Is(err, retryableError{}):
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-time.After(bo.NextBackOff()):
 			}
 		default:
@@ -96,13 +95,13 @@ func (locker *Leaser) runOnce(ctx context.Context, resetBackoff func()) error {
 	if status.Code(err) == codes.AlreadyExists {
 		return nil
 	} else if err != nil {
-		log.Warn(ctx).Err(err).Msg("leaser: error acquiring lease")
+		log.Ctx(ctx).Error().Err(err).Str("lease_name", locker.leaseName).Msg("leaser: error acquiring lease")
 		return retryableError{err}
 	}
 	resetBackoff()
 	leaseID := res.Id
 
-	log.Debug(ctx).
+	log.Ctx(ctx).Debug().
 		Str("lease_name", locker.leaseName).
 		Str("lease_id", leaseID).
 		Msg("leaser: lease acquired")
@@ -113,7 +112,9 @@ func (locker *Leaser) runOnce(ctx context.Context, resetBackoff func()) error {
 func (locker *Leaser) withLease(ctx context.Context, leaseID string) error {
 	// always release the lock in case the parent context is canceled
 	defer func() {
-		_, _ = locker.handler.GetDataBrokerServiceClient().ReleaseLease(context.Background(), &ReleaseLeaseRequest{
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), locker.ttl)
+		defer cancel()
+		_, _ = locker.handler.GetDataBrokerServiceClient().ReleaseLease(ctx, &ReleaseLeaseRequest{
 			Name: locker.leaseName,
 			Id:   leaseID,
 		})
@@ -141,14 +142,14 @@ func (locker *Leaser) withLease(ctx context.Context, leaseID string) error {
 				Duration: durationpb.New(locker.ttl),
 			})
 			if status.Code(err) == codes.AlreadyExists {
-				log.Debug(ctx).
+				log.Ctx(ctx).Debug().
 					Str("lease_name", locker.leaseName).
 					Str("lease_id", leaseID).
 					Msg("leaser: lease lost")
 				// failed to renew lease
 				return nil
 			} else if err != nil {
-				log.Warn(ctx).Err(err).Msg("leaser: error renewing lease")
+				log.Ctx(ctx).Error().Err(err).Str("lease_name", locker.leaseName).Msg("leaser: error renewing lease")
 				return retryableError{err}
 			}
 		}

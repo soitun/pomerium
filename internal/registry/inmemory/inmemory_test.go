@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/pomerium/pomerium/pkg/grpc/registry"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
+
+	pb "github.com/pomerium/pomerium/pkg/grpc/registry"
 )
 
 const (
@@ -215,7 +215,7 @@ func (l serviceList) Less(i, j int) bool {
 	return l[i].Kind < l[j].Kind
 }
 
-func (l serviceList) Swap(i, j int) { t := l[i]; l[i] = l[j]; l[j] = t }
+func (l serviceList) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
 
 func assertEqual(t *testing.T, want, got []*pb.Service) {
 	t.Helper()

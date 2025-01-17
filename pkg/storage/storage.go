@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
@@ -33,14 +34,18 @@ type Backend interface {
 	GetOptions(ctx context.Context, recordType string) (*databroker.Options, error)
 	// Lease acquires a lease, or renews an existing one. If the lease is acquired true is returned.
 	Lease(ctx context.Context, leaseName, leaseID string, ttl time.Duration) (bool, error)
+	// ListTypes lists all the known record types.
+	ListTypes(ctx context.Context) ([]string, error)
 	// Put is used to insert or update records.
 	Put(ctx context.Context, records []*databroker.Record) (serverVersion uint64, err error)
+	// Patch is used to update specific fields of existing records.
+	Patch(ctx context.Context, records []*databroker.Record, fields *fieldmaskpb.FieldMask) (serverVersion uint64, patchedRecords []*databroker.Record, err error)
 	// SetOptions sets the options for a type.
 	SetOptions(ctx context.Context, recordType string, options *databroker.Options) error
 	// Sync syncs record changes after the specified version.
-	Sync(ctx context.Context, serverVersion, recordVersion uint64) (RecordStream, error)
+	Sync(ctx context.Context, recordType string, serverVersion, recordVersion uint64) (RecordStream, error)
 	// SyncLatest syncs all the records.
-	SyncLatest(ctx context.Context) (serverVersion uint64, stream RecordStream, err error)
+	SyncLatest(ctx context.Context, recordType string, filter FilterExpression) (serverVersion, recordVersion uint64, stream RecordStream, err error)
 }
 
 // MatchAny searches any data with a query.
@@ -52,7 +57,7 @@ func MatchAny(any *anypb.Any, query string) bool {
 	msg, err := any.UnmarshalNew()
 	if err != nil {
 		// ignore invalid any types
-		log.Error(context.TODO()).Err(err).Msg("storage: invalid any type")
+		log.Error().Err(err).Msg("storage: invalid any type")
 		return false
 	}
 
@@ -107,9 +112,14 @@ func matchProtoListValue(fd protoreflect.FieldDescriptor, l protoreflect.List, q
 
 func matchProtoMapValue(fd protoreflect.FieldDescriptor, m protoreflect.Map, query string) bool {
 	matches := false
-	m.Range(func(k protoreflect.MapKey, v protoreflect.Value) bool {
+	m.Range(func(_ protoreflect.MapKey, v protoreflect.Value) bool {
 		matches = matches || matchProtoSingularValue(fd, v, query)
 		return !matches
 	})
 	return matches
+}
+
+// IsNotFound returns true if the error is because a record was not found.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || status.Code(err) == codes.NotFound
 }

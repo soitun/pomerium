@@ -29,7 +29,7 @@ func NewHTTPTransport(src Source) *http.Transport {
 			}
 			lock.Unlock()
 		} else {
-			log.Error(ctx).Err(err).Msg("config: error getting cert pool")
+			log.Ctx(ctx).Error().Err(err).Msg("config: error getting cert pool")
 		}
 	}
 	src.OnConfigChange(context.Background(), update)
@@ -80,7 +80,7 @@ func NewPolicyHTTPTransport(options *Options, policy *Policy, disableHTTP2 bool)
 			tlsClientConfig.MinVersion = tls.VersionTLS12
 			isCustomClientConfig = true
 		} else {
-			log.Error(context.TODO()).Err(err).Msg("config: error getting ca cert pool")
+			log.Error().Err(err).Msg("config: error getting ca cert pool")
 		}
 	}
 
@@ -91,7 +91,7 @@ func NewPolicyHTTPTransport(options *Options, policy *Policy, disableHTTP2 bool)
 			tlsClientConfig.MinVersion = tls.VersionTLS12
 			isCustomClientConfig = true
 		} else {
-			log.Error(context.TODO()).Err(err).Msg("config: error getting custom ca cert pool")
+			log.Error().Err(err).Msg("config: error getting custom ca cert pool")
 		}
 	}
 
@@ -116,4 +116,16 @@ func NewPolicyHTTPTransport(options *Options, policy *Policy, disableHTTP2 bool)
 		transport.TLSClientConfig = &tlsClientConfig
 	}
 	return c.Then(transport)
+}
+
+// GetTLSClientTransport returns http transport accounting for custom CAs from config
+func GetTLSClientTransport(cfg *Config) (*http.Transport, error) {
+	tlsConfig, err := cfg.GetTLSClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	return &http.Transport{
+		TLSClientConfig:   tlsConfig,
+		ForceAttemptHTTP2: true,
+	}, nil
 }

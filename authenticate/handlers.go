@@ -13,26 +13,19 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
-	"golang.org/x/oauth2"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/pomerium/csrf"
-	"github.com/pomerium/pomerium/authenticate/handlers"
-	"github.com/pomerium/pomerium/authenticate/handlers/webauthn"
+	"github.com/pomerium/pomerium/internal/authenticateflow"
+	"github.com/pomerium/pomerium/internal/handlers"
 	"github.com/pomerium/pomerium/internal/httputil"
-	"github.com/pomerium/pomerium/internal/identity"
-	"github.com/pomerium/pomerium/internal/identity/manager"
-	"github.com/pomerium/pomerium/internal/identity/oidc"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/middleware"
 	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
 	"github.com/pomerium/pomerium/internal/urlutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
-	"github.com/pomerium/pomerium/pkg/grpc/databroker"
-	"github.com/pomerium/pomerium/pkg/grpc/directory"
-	"github.com/pomerium/pomerium/pkg/grpc/session"
-	"github.com/pomerium/pomerium/pkg/grpc/user"
+	"github.com/pomerium/pomerium/pkg/identity"
+	"github.com/pomerium/pomerium/pkg/identity/oidc"
 )
 
 // Handler returns the authenticate service's handler chain.
@@ -50,9 +43,8 @@ func (a *Authenticate) Mount(r *mux.Router) {
 		options := a.options.Load()
 		state := a.state.Load()
 		csrfKey := fmt.Sprintf("%s_csrf", options.CookieName)
-		return csrf.Protect(
-			state.cookieSecret,
-			csrf.Secure(options.CookieSecure),
+		csrfOptions := []csrf.Option{
+			csrf.Secure(true),
 			csrf.Path("/"),
 			csrf.UnsafePaths(
 				[]string{
@@ -61,20 +53,21 @@ func (a *Authenticate) Mount(r *mux.Router) {
 			csrf.FormValueName("state"), // rfc6749#section-10.12
 			csrf.CookieName(csrfKey),
 			csrf.FieldName(csrfKey),
-			csrf.SameSite(csrf.SameSiteLaxMode),
 			csrf.ErrorHandler(httputil.HandlerFunc(httputil.CSRFFailureHandler)),
-		)(h)
+			csrf.SameSite(options.GetCSRFSameSite()),
+		}
+		return csrf.Protect(state.cookieSecret, csrfOptions...)(h)
 	})
 
 	// redirect / to /.pomerium/
 	r.Path("/").Handler(http.RedirectHandler("/.pomerium/", http.StatusFound))
 
 	r.Path("/robots.txt").HandlerFunc(a.RobotsTxt).Methods(http.MethodGet)
+
 	// Identity Provider (IdP) endpoints
-	r.Path("/oauth2/callback").Handler(httputil.HandlerFunc(a.OAuthCallback)).Methods(http.MethodGet)
+	r.Path("/oauth2/callback").Handler(httputil.HandlerFunc(a.OAuthCallback)).Methods(http.MethodGet, http.MethodPost)
 
 	a.mountDashboard(r)
-	a.mountWellKnown(r)
 }
 
 func (a *Authenticate) mountDashboard(r *mux.Router) {
@@ -82,9 +75,9 @@ func (a *Authenticate) mountDashboard(r *mux.Router) {
 	c := cors.New(cors.Options{
 		AllowOriginRequestFunc: func(r *http.Request, _ string) bool {
 			state := a.state.Load()
-			err := middleware.ValidateRequestURL(a.getExternalRequest(r), state.sharedKey)
-			if err != nil {
-				log.FromRequest(r).Info().Err(err).Msg("authenticate: origin blocked")
+			err := state.flow.VerifyAuthenticateSignature(r)
+			if err == nil {
+				log.FromRequest(r).Info().Msg("authenticate: signed URL, adding CORS headers")
 			}
 			return err == nil
 		},
@@ -93,18 +86,18 @@ func (a *Authenticate) mountDashboard(r *mux.Router) {
 	})
 	sr.Use(c.Handler)
 	sr.Use(a.RetrieveSession)
+
+	// routes that don't need a session:
+	sr.Path("/sign_out").Handler(httputil.HandlerFunc(a.SignOut))
+	sr.Path("/signed_out").Handler(httputil.HandlerFunc(a.signedOut)).Methods(http.MethodGet)
+
+	// routes that need a session:
+	sr = sr.NewRoute().Subrouter()
 	sr.Use(a.VerifySession)
 	sr.Path("/").Handler(a.requireValidSignatureOnRedirect(a.userInfo))
-	sr.Path("/sign_in").Handler(a.requireValidSignature(a.SignIn))
-	sr.Path("/sign_out").Handler(httputil.HandlerFunc(a.SignOut))
-	sr.Path("/webauthn").Handler(a.webauthn)
+	sr.Path("/sign_in").Handler(httputil.HandlerFunc(a.SignIn))
 	sr.Path("/device-enrolled").Handler(httputil.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		userInfoData, err := a.getUserInfoData(r)
-		if err != nil {
-			return err
-		}
-
-		handlers.DeviceEnrolled(userInfoData).ServeHTTP(w, r)
+		handlers.DeviceEnrolled(a.getUserInfoData(r)).ServeHTTP(w, r)
 		return nil
 	}))
 
@@ -112,43 +105,9 @@ func (a *Authenticate) mountDashboard(r *mux.Router) {
 	cr.Path("/").Handler(a.requireValidSignature(a.Callback)).Methods(http.MethodGet)
 }
 
-func (a *Authenticate) mountWellKnown(r *mux.Router) {
-	wk := r.PathPrefix("/.well-known/pomerium").Subrouter()
-	wk.Path("/jwks.json").Handler(httputil.HandlerFunc(a.jwks)).Methods(http.MethodGet)
-	wk.Path("/").Handler(httputil.HandlerFunc(a.wellKnown)).Methods(http.MethodGet)
-}
-
-// wellKnown returns a list of well known URLS for Pomerium.
-//
-// https://en.wikipedia.org/wiki/List_of_/.well-known/_services_offered_by_webservers
-func (a *Authenticate) wellKnown(w http.ResponseWriter, r *http.Request) error {
-	state := a.state.Load()
-	wellKnownURLS := struct {
-		OAuth2Callback        string `json:"authentication_callback_endpoint"` // RFC6749
-		JSONWebKeySetURL      string `json:"jwks_uri"`                         // RFC7517
-		FrontchannelLogoutURI string `json:"frontchannel_logout_uri"`          // https://openid.net/specs/openid-connect-frontchannel-1_0.html
-	}{
-		state.redirectURL.ResolveReference(&url.URL{Path: "/oauth2/callback"}).String(),
-		state.redirectURL.ResolveReference(&url.URL{Path: "/.well-known/pomerium/jwks.json"}).String(),
-		state.redirectURL.ResolveReference(&url.URL{Path: "/.pomerium/sign_out"}).String(),
-	}
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
-	httputil.RenderJSON(w, http.StatusOK, wellKnownURLS)
-	return nil
-}
-
-// jwks returns the signing key(s) the client can use to validate signatures
-// from the authorization server.
-//
-// https://tools.ietf.org/html/rfc8414
-func (a *Authenticate) jwks(w http.ResponseWriter, r *http.Request) error {
-	httputil.RenderJSON(w, http.StatusOK, a.state.Load().jwk)
-	return nil
-}
-
-// RetrieveSession is the middleware used retrieve session by the sessionLoaders
+// RetrieveSession is the middleware used retrieve session by the sessionLoader
 func (a *Authenticate) RetrieveSession(next http.Handler) http.Handler {
-	return sessions.RetrieveSession(a.state.Load().sessionLoaders...)(next)
+	return sessions.RetrieveSession(a.state.Load().sessionLoader)(next)
 }
 
 // VerifySession is the middleware used to enforce a valid authentication
@@ -159,7 +118,7 @@ func (a *Authenticate) VerifySession(next http.Handler) http.Handler {
 		defer span.End()
 
 		state := a.state.Load()
-		idpID := r.FormValue(urlutil.QueryIdentityProviderID)
+		idpID := a.getIdentityProviderIDForRequest(r)
 
 		sessionState, err := a.getSessionFromCtx(ctx)
 		if err != nil {
@@ -173,20 +132,17 @@ func (a *Authenticate) VerifySession(next http.Handler) http.Handler {
 		if sessionState.IdentityProviderID != idpID {
 			log.FromRequest(r).Info().
 				Str("idp_id", idpID).
+				Str("session_idp_id", sessionState.IdentityProviderID).
 				Str("id", sessionState.ID).
 				Msg("authenticate: session not associated with identity provider")
 			return a.reauthenticateOrFail(w, r, err)
 		}
 
-		if state.dataBrokerClient == nil {
-			return errors.New("authenticate: databroker client cannot be nil")
-		}
-		if _, err = session.Get(ctx, state.dataBrokerClient, sessionState.ID); err != nil {
+		if err := state.flow.VerifySession(ctx, r, sessionState); err != nil {
 			log.FromRequest(r).Info().
 				Err(err).
 				Str("idp_id", idpID).
-				Str("id", sessionState.ID).
-				Msg("authenticate: session not found in databroker")
+				Msg("authenticate: couldn't verify session")
 			return a.reauthenticateOrFail(w, r, err)
 		}
 
@@ -196,7 +152,7 @@ func (a *Authenticate) VerifySession(next http.Handler) http.Handler {
 }
 
 // RobotsTxt handles the /robots.txt route.
-func (a *Authenticate) RobotsTxt(w http.ResponseWriter, r *http.Request) {
+func (a *Authenticate) RobotsTxt(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "User-agent: *\nDisallow: /")
@@ -209,73 +165,20 @@ func (a *Authenticate) SignIn(w http.ResponseWriter, r *http.Request) error {
 
 	state := a.state.Load()
 
-	redirectURL, err := urlutil.ParseAndValidateURL(r.FormValue(urlutil.QueryRedirectURI))
-	if err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	jwtAudience := []string{state.redirectURL.Host, redirectURL.Host}
-
-	// if the callback is explicitly set, set it and add an additional audience
-	if callbackStr := r.FormValue(urlutil.QueryCallbackURI); callbackStr != "" {
-		callbackURL, err := urlutil.ParseAndValidateURL(callbackStr)
-		if err != nil {
-			return httputil.NewError(http.StatusBadRequest, err)
-		}
-		jwtAudience = append(jwtAudience, callbackURL.Host)
-	}
-
-	// add an additional claim for the forward-auth host, if set
-	if fwdAuth := r.FormValue(urlutil.QueryForwardAuth); fwdAuth != "" {
-		jwtAudience = append(jwtAudience, fwdAuth)
-	}
-
 	s, err := a.getSessionFromCtx(ctx)
 	if err != nil {
 		state.sessionStore.ClearSession(w, r)
 		return err
 	}
 
-	// start over if this is a different identity provider
-	if s == nil || s.IdentityProviderID != r.FormValue(urlutil.QueryIdentityProviderID) {
-		s = sessions.NewState(urlutil.QueryIdentityProviderID)
-	}
-
-	newSession := s.WithNewIssuer(state.redirectURL.Host, jwtAudience)
-
-	// re-persist the session, useful when session was evicted from session
-	if err := state.sessionStore.SaveSession(w, r, s); err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	// sign the route session, as a JWT
-	signedJWT, err := state.sharedEncoder.Marshal(newSession)
-	if err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	// encrypt our route-scoped JWT to avoid accidental logging of queryparams
-	encryptedJWT := cryptutil.Encrypt(a.state.Load().sharedCipher, signedJWT, nil)
-	// base64 our encrypted payload for URL-friendlyness
-	encodedJWT := base64.URLEncoding.EncodeToString(encryptedJWT)
-
-	callbackURL, err := urlutil.GetCallbackURL(r, encodedJWT)
-	if err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	// build our hmac-d redirect URL with our session, pointing back to the
-	// proxy's callback URL which is responsible for setting our new route-session
-	uri := urlutil.NewSignedURL(state.sharedKey, callbackURL)
-	httputil.Redirect(w, r, uri.String(), http.StatusFound)
-	return nil
+	return state.flow.SignIn(w, r, s)
 }
 
 // SignOut signs the user out and attempts to revoke the user's identity session
 // Handles both GET and POST.
 func (a *Authenticate) SignOut(w http.ResponseWriter, r *http.Request) error {
 	// check for an HMAC'd URL. If none is found, show a confirmation page.
-	err := middleware.ValidateRequestURL(a.getExternalRequest(r), a.state.Load().sharedKey)
+	err := a.state.Load().flow.VerifyAuthenticateSignature(r)
 	if err != nil {
 		authenticateURL, err := a.options.Load().GetAuthenticateURL()
 		if err != nil {
@@ -283,7 +186,8 @@ func (a *Authenticate) SignOut(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		handlers.SignOutConfirm(handlers.SignOutConfirmData{
-			URL: urlutil.SignOutURL(r, authenticateURL, a.state.Load().sharedKey),
+			URL:             urlutil.SignOutURL(r, authenticateURL, a.state.Load().sharedKey),
+			BrandingOptions: a.options.Load().BrandingOptions,
 		}).ServeHTTP(w, r)
 		return nil
 	}
@@ -297,41 +201,56 @@ func (a *Authenticate) signOutRedirect(w http.ResponseWriter, r *http.Request) e
 	defer span.End()
 
 	options := a.options.Load()
+	idpID := a.getIdentityProviderIDForRequest(r)
 
-	idp, err := a.cfg.getIdentityProvider(options, r.FormValue(urlutil.QueryIdentityProviderID))
+	authenticator, err := a.cfg.getIdentityProvider(options, idpID)
 	if err != nil {
 		return err
 	}
 
 	rawIDToken := a.revokeSession(ctx, w, r)
 
-	redirectString := ""
-	signOutURL, err := a.options.Load().GetSignOutRedirectURL()
+	authenticateURL, err := options.GetAuthenticateURL()
+	if err != nil {
+		return fmt.Errorf("error getting authenticate url: %w", err)
+	}
+
+	signOutRedirectURL, err := options.GetSignOutRedirectURL()
 	if err != nil {
 		return err
 	}
-	if signOutURL != nil {
-		redirectString = signOutURL.String()
-	}
+
+	var signOutURL string
 	if uri := r.FormValue(urlutil.QueryRedirectURI); uri != "" {
-		redirectString = uri
+		signOutURL = uri
+	} else if signOutRedirectURL != nil {
+		signOutURL = signOutRedirectURL.String()
 	}
 
-	endSessionURL, err := idp.LogOut()
-	if err == nil && redirectString != "" {
-		params := url.Values{}
-		params.Add("id_token_hint", rawIDToken)
-		params.Add("post_logout_redirect_uri", redirectString)
-		endSessionURL.RawQuery = params.Encode()
-		redirectString = endSessionURL.String()
-	} else if !errors.Is(err, oidc.ErrSignoutNotImplemented) {
-		log.Warn(r.Context()).Err(err).Msg("authenticate.SignOut: failed getting session")
-	}
-	if redirectString != "" {
-		httputil.Redirect(w, r, redirectString, http.StatusFound)
+	authenticateSignedOutURL := authenticateURL.ResolveReference(&url.URL{
+		Path: "/.pomerium/signed_out",
+	}).String()
+
+	if err := authenticator.SignOut(w, r, rawIDToken, authenticateSignedOutURL, signOutURL); err == nil {
 		return nil
+	} else if !errors.Is(err, oidc.ErrSignoutNotImplemented) {
+		log.Ctx(r.Context()).Error().Err(err).Msg("authenticate: failed to get sign out url for authenticator")
 	}
-	return httputil.NewError(http.StatusOK, errors.New("user logged out"))
+
+	// if the authenticator failed to sign out, and no sign out url is defined, just go to the signed out page
+	if signOutURL == "" {
+		signOutURL = authenticateSignedOutURL
+	}
+
+	httputil.Redirect(w, r, signOutURL, http.StatusFound)
+	return nil
+}
+
+func (a *Authenticate) signedOut(w http.ResponseWriter, r *http.Request) error {
+	handlers.SignedOut(handlers.SignedOutData{
+		BrandingOptions: a.options.Load().BrandingOptions,
+	}).ServeHTTP(w, r)
+	return nil
 }
 
 // reauthenticateOrFail starts the authenticate process by redirecting the
@@ -351,13 +270,16 @@ func (a *Authenticate) reauthenticateOrFail(w http.ResponseWriter, r *http.Reque
 		return httputil.NewError(http.StatusUnauthorized, err)
 	}
 
-	options := a.options.Load()
 	state := a.state.Load()
+	options := a.options.Load()
+	idpID := a.getIdentityProviderIDForRequest(r)
 
-	idp, err := a.cfg.getIdentityProvider(options, r.FormValue(urlutil.QueryIdentityProviderID))
+	authenticator, err := a.cfg.getIdentityProvider(options, idpID)
 	if err != nil {
 		return err
 	}
+
+	state.flow.LogAuthenticateEvent(r)
 
 	state.sessionStore.ClearSession(w, r)
 	redirectURL := state.redirectURL.ResolveReference(r.URL)
@@ -367,12 +289,12 @@ func (a *Authenticate) reauthenticateOrFail(w http.ResponseWriter, r *http.Reque
 	enc := cryptutil.Encrypt(state.cookieCipher, []byte(redirectURL.String()), b)
 	b = append(b, enc...)
 	encodedState := base64.URLEncoding.EncodeToString(b)
-	signinURL, err := idp.GetSignInURL(encodedState)
+
+	err = authenticator.SignIn(w, r, encodedState)
 	if err != nil {
 		return httputil.NewError(http.StatusInternalServerError,
-			fmt.Errorf("failed to get sign in url: %w", err))
+			fmt.Errorf("failed to sign in: %w", err))
 	}
-	httputil.Redirect(w, r, signinURL, http.StatusFound)
 	return nil
 }
 
@@ -402,8 +324,8 @@ func (a *Authenticate) getOAuthCallback(w http.ResponseWriter, r *http.Request) 
 	ctx, span := trace.StartSpan(r.Context(), "authenticate.getOAuthCallback")
 	defer span.End()
 
-	options := a.options.Load()
 	state := a.state.Load()
+	options := a.options.Load()
 
 	// Error Authentication Response: rfc6749#section-4.1.2.1 & OIDC#3.1.2.6
 	//
@@ -431,11 +353,6 @@ func (a *Authenticate) getOAuthCallback(w http.ResponseWriter, r *http.Request) 
 		return nil, httputil.NewError(http.StatusBadRequest, fmt.Errorf("state malformed, size: %d", len(statePayload)))
 	}
 
-	// verify that the returned timestamp is valid
-	if err := cryptutil.ValidTimestamp(statePayload[1]); err != nil {
-		return nil, httputil.NewError(http.StatusBadRequest, err)
-	}
-
 	// Use our AEAD construct to enforce secrecy and authenticity:
 	// mac: to validate the nonce again, and above timestamp
 	// decrypt: to prevent leaking 'redirect_uri' to IdP or logs
@@ -449,9 +366,21 @@ func (a *Authenticate) getOAuthCallback(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return nil, httputil.NewError(http.StatusBadRequest, err)
 	}
-	idpID := redirectURL.Query().Get(urlutil.QueryIdentityProviderID)
 
-	idp, err := a.cfg.getIdentityProvider(options, idpID)
+	// verify that the returned timestamp is valid
+	if err := cryptutil.ValidTimestamp(statePayload[1]); err != nil {
+		return nil, httputil.NewError(http.StatusBadRequest, err).WithDescription(fmt.Sprintf(`
+The request expired. This may be because a login attempt took too long, or because the server's clock is out of sync.
+
+Try again by following this link: [%s](%s).
+
+Or contact your administrator.
+`, redirectURL.String(), redirectURL.String()))
+	}
+
+	idpID := state.flow.GetIdentityProviderIDForURLValues(redirectURL.Query())
+
+	authenticator, err := a.cfg.getIdentityProvider(options, idpID)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +389,7 @@ func (a *Authenticate) getOAuthCallback(w http.ResponseWriter, r *http.Request) 
 	//
 	// Exchange the supplied Authorization Code for a valid user session.
 	var claims identity.SessionClaims
-	accessToken, err := idp.Authenticate(ctx, code, &claims)
+	accessToken, err := authenticator.Authenticate(ctx, code, &claims)
 	if err != nil {
 		return nil, fmt.Errorf("error redeeming authenticate code: %w", err)
 	}
@@ -476,10 +405,9 @@ func (a *Authenticate) getOAuthCallback(w http.ResponseWriter, r *http.Request) 
 		newState.Audience = append(newState.Audience, nextRedirectURL.Hostname())
 	}
 
-	// save the session and access token to the databroker
-	err = a.saveSessionToDataBroker(ctx, r, &newState, claims, accessToken)
-	if err != nil {
-		return nil, httputil.NewError(http.StatusInternalServerError, err)
+	// save the session and access token to the databroker/cookie store
+	if err := state.flow.PersistSession(ctx, w, &newState, claims, accessToken); err != nil {
+		return nil, fmt.Errorf("failed saving new session: %w", err)
 	}
 
 	// ...  and the user state to local storage.
@@ -506,264 +434,64 @@ func (a *Authenticate) getSessionFromCtx(ctx context.Context) (*sessions.State, 
 func (a *Authenticate) userInfo(w http.ResponseWriter, r *http.Request) error {
 	ctx, span := trace.StartSpan(r.Context(), "authenticate.userInfo")
 	defer span.End()
+
+	options := a.options.Load()
+
 	r = r.WithContext(ctx)
-	r = a.getExternalRequest(r)
+	r = authenticateflow.GetExternalAuthenticateRequest(r, options)
 
 	// if we came in with a redirect URI, save it to a cookie so it doesn't expire with the HMAC
 	if redirectURI := r.FormValue(urlutil.QueryRedirectURI); redirectURI != "" {
 		u := urlutil.GetAbsoluteURL(r)
 		u.RawQuery = ""
 
-		http.SetCookie(w, &http.Cookie{
-			Name:  urlutil.QueryRedirectURI,
-			Value: redirectURI,
-		})
+		cookie := options.NewCookie()
+		cookie.Name = urlutil.QueryRedirectURI
+		cookie.Value = redirectURI
+
+		http.SetCookie(w, cookie)
 		http.Redirect(w, r, u.String(), http.StatusFound)
 		return nil
 	}
 
-	userInfoData, err := a.getUserInfoData(r)
-	if err != nil {
-		return err
-	}
-
-	handlers.UserInfo(userInfoData).ServeHTTP(w, r)
+	handlers.UserInfo(a.getUserInfoData(r)).ServeHTTP(w, r)
 	return nil
 }
 
-func (a *Authenticate) getUserInfoData(r *http.Request) (handlers.UserInfoData, error) {
+func (a *Authenticate) getUserInfoData(r *http.Request) handlers.UserInfoData {
 	state := a.state.Load()
-
-	authenticateURL, err := a.options.Load().GetAuthenticateURL()
-	if err != nil {
-		return handlers.UserInfoData{}, err
-	}
 
 	s, err := a.getSessionFromCtx(r.Context())
 	if err != nil {
 		s.ID = uuid.New().String()
 	}
 
-	pbSession, isImpersonated, err := a.getCurrentSession(r.Context())
-	if err != nil {
-		pbSession = &session.Session{
-			Id: s.ID,
-		}
-	}
-
-	pbUser, err := a.getUser(r.Context(), pbSession.GetUserId())
-	if err != nil {
-		pbUser = &user.User{
-			Id: pbSession.GetUserId(),
-		}
-	}
-	pbDirectoryUser, err := a.getDirectoryUser(r.Context(), pbSession.GetUserId())
-	if err != nil {
-		pbDirectoryUser = &directory.User{
-			Id: pbSession.GetUserId(),
-		}
-	}
-	var groups []*directory.Group
-	for _, groupID := range pbDirectoryUser.GetGroupIds() {
-		pbDirectoryGroup, err := directory.GetGroup(r.Context(), state.dataBrokerClient, groupID)
-		if err != nil {
-			pbDirectoryGroup = &directory.Group{
-				Id:    groupID,
-				Name:  groupID,
-				Email: groupID,
-			}
-		}
-		groups = append(groups, pbDirectoryGroup)
-	}
-
-	creationOptions, requestOptions, _ := a.webauthn.GetOptions(r.Context())
-
-	return handlers.UserInfoData{
-		CSRFToken:       csrf.Token(r),
-		DirectoryGroups: groups,
-		DirectoryUser:   pbDirectoryUser,
-		IsImpersonated:  isImpersonated,
-		Session:         pbSession,
-		User:            pbUser,
-
-		WebAuthnCreationOptions: creationOptions,
-		WebAuthnRequestOptions:  requestOptions,
-		WebAuthnURL:             urlutil.WebAuthnURL(r, authenticateURL, state.sharedKey, r.URL.Query()),
-	}, nil
-}
-
-func (a *Authenticate) saveSessionToDataBroker(
-	ctx context.Context,
-	r *http.Request,
-	sessionState *sessions.State,
-	claims identity.SessionClaims,
-	accessToken *oauth2.Token,
-) error {
-	state := a.state.Load()
-	options := a.options.Load()
-
-	idp, err := a.cfg.getIdentityProvider(options, r.FormValue(urlutil.QueryIdentityProviderID))
-	if err != nil {
-		return err
-	}
-
-	sessionExpiry := timestamppb.New(time.Now().Add(options.CookieExpire))
-	idTokenIssuedAt := timestamppb.New(sessionState.IssuedAt.Time())
-
-	s := &session.Session{
-		Id:         sessionState.ID,
-		UserId:     sessionState.UserID(idp.Name()),
-		IssuedAt:   timestamppb.Now(),
-		AccessedAt: timestamppb.Now(),
-		ExpiresAt:  sessionExpiry,
-		IdToken: &session.IDToken{
-			Issuer:    sessionState.Issuer, // todo(bdd): the issuer is not authN but the downstream IdP from the claims
-			Subject:   sessionState.Subject,
-			ExpiresAt: sessionExpiry,
-			IssuedAt:  idTokenIssuedAt,
-		},
-		OauthToken: manager.ToOAuthToken(accessToken),
-		Audience:   sessionState.Audience,
-	}
-	s.SetRawIDToken(claims.RawIDToken)
-	s.AddClaims(claims.Flatten())
-
-	var managerUser manager.User
-	managerUser.User, _ = user.Get(ctx, state.dataBrokerClient, s.GetUserId())
-	if managerUser.User == nil {
-		// if no user exists yet, create a new one
-		managerUser.User = &user.User{
-			Id: s.GetUserId(),
-		}
-	}
-	err = idp.UpdateUserInfo(ctx, accessToken, &managerUser)
-	if err != nil {
-		return fmt.Errorf("authenticate: error retrieving user info: %w", err)
-	}
-	_, err = databroker.Put(ctx, state.dataBrokerClient, managerUser.User)
-	if err != nil {
-		return fmt.Errorf("authenticate: error saving user: %w", err)
-	}
-
-	res, err := session.Put(ctx, state.dataBrokerClient, s)
-	if err != nil {
-		return fmt.Errorf("authenticate: error saving session: %w", err)
-	}
-	sessionState.DatabrokerServerVersion = res.GetServerVersion()
-	sessionState.DatabrokerRecordVersion = res.GetRecord().GetVersion()
-
-	_, err = state.directoryClient.RefreshUser(ctx, &directory.RefreshUserRequest{
-		UserId:      s.UserId,
-		AccessToken: accessToken.AccessToken,
-	})
-	if err != nil {
-		log.Error(ctx).Err(err).Msg("directory: failed to refresh user data")
-	}
-
-	return nil
+	data := state.flow.GetUserInfoData(r, s)
+	data.CSRFToken = csrf.Token(r)
+	data.BrandingOptions = a.options.Load().BrandingOptions
+	return data
 }
 
 // revokeSession always clears the local session and tries to revoke the associated session stored in the
 // databroker. If successful, it returns the original `id_token` of the session, if failed, returns
 // and empty string.
 func (a *Authenticate) revokeSession(ctx context.Context, w http.ResponseWriter, r *http.Request) string {
-	options := a.options.Load()
 	state := a.state.Load()
+	options := a.options.Load()
 
 	// clear the user's local session no matter what
 	defer state.sessionStore.ClearSession(w, r)
 
-	idp, err := a.cfg.getIdentityProvider(options, r.FormValue(urlutil.QueryIdentityProviderID))
+	idpID := r.FormValue(urlutil.QueryIdentityProviderID)
+
+	authenticator, err := a.cfg.getIdentityProvider(options, idpID)
 	if err != nil {
 		return ""
 	}
 
-	var rawIDToken string
-	sessionState, err := a.getSessionFromCtx(ctx)
-	if err != nil {
-		return rawIDToken
-	}
+	sessionState, _ := a.getSessionFromCtx(ctx)
 
-	if s, _ := session.Get(ctx, state.dataBrokerClient, sessionState.ID); s != nil && s.OauthToken != nil {
-		rawIDToken = s.GetIdToken().GetRaw()
-		if err := idp.Revoke(ctx, manager.FromOAuthToken(s.OauthToken)); err != nil {
-			log.Ctx(ctx).Warn().Err(err).Msg("authenticate: failed to revoke access token")
-		}
-	}
-	if err := session.Delete(ctx, state.dataBrokerClient, sessionState.ID); err != nil {
-		log.Ctx(ctx).Warn().Err(err).Msg("authenticate: failed to delete session from session store")
-	}
-
-	return rawIDToken
-}
-
-func (a *Authenticate) getCurrentSession(ctx context.Context) (s *session.Session, isImpersonated bool, err error) {
-	client := a.state.Load().dataBrokerClient
-
-	sessionState, err := a.getSessionFromCtx(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-
-	isImpersonated = false
-	s, err = session.Get(ctx, client, sessionState.ID)
-	if s.GetImpersonateSessionId() != "" {
-		s, err = session.Get(ctx, client, s.GetImpersonateSessionId())
-		isImpersonated = true
-	}
-
-	return s, isImpersonated, err
-}
-
-func (a *Authenticate) getUser(ctx context.Context, userID string) (*user.User, error) {
-	client := a.state.Load().dataBrokerClient
-	return user.Get(ctx, client, userID)
-}
-
-func (a *Authenticate) getDirectoryUser(ctx context.Context, userID string) (*directory.User, error) {
-	client := a.state.Load().dataBrokerClient
-	return directory.GetUser(ctx, client, userID)
-}
-
-func (a *Authenticate) getWebauthnState(ctx context.Context) (*webauthn.State, error) {
-	state := a.state.Load()
-
-	s, _, err := a.getCurrentSession(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ss, err := a.getSessionFromCtx(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	authenticateURL, err := a.options.Load().GetAuthenticateURL()
-	if err != nil {
-		return nil, err
-	}
-
-	internalAuthenticateURL, err := a.options.Load().GetInternalAuthenticateURL()
-	if err != nil {
-		return nil, err
-	}
-
-	pomeriumDomains, err := a.options.Load().GetAllRouteableHTTPDomains()
-	if err != nil {
-		return nil, err
-	}
-
-	return &webauthn.State{
-		AuthenticateURL:         authenticateURL,
-		InternalAuthenticateURL: internalAuthenticateURL,
-		SharedKey:               state.sharedKey,
-		Client:                  state.dataBrokerClient,
-		PomeriumDomains:         pomeriumDomains,
-		Session:                 s,
-		SessionState:            ss,
-		SessionStore:            state.sessionStore,
-		RelyingParty:            state.webauthnRelyingParty,
-	}, nil
+	return state.flow.RevokeSession(ctx, r, authenticator, sessionState)
 }
 
 // Callback handles the result of a successful call to the authenticate service
@@ -812,4 +540,11 @@ func (a *Authenticate) saveCallbackSession(w http.ResponseWriter, r *http.Reques
 		return nil, fmt.Errorf("proxy: callback session save failure: %w", err)
 	}
 	return rawJWT, nil
+}
+
+func (a *Authenticate) getIdentityProviderIDForRequest(r *http.Request) string {
+	if err := r.ParseForm(); err != nil {
+		return ""
+	}
+	return a.state.Load().flow.GetIdentityProviderIDForURLValues(r.Form)
 }

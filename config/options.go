@@ -2,47 +2,48 @@ package config
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"iter"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	envoy_http_connection_manager "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	goset "github.com/hashicorp/go-set/v3"
 	"github.com/mitchellh/mapstructure"
+	"github.com/rs/zerolog"
 	"github.com/spf13/viper"
 	"github.com/volatiletech/null/v9"
+	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/pomerium/pomerium/internal/directory/azure"
-	"github.com/pomerium/pomerium/internal/directory/github"
-	"github.com/pomerium/pomerium/internal/directory/gitlab"
-	"github.com/pomerium/pomerium/internal/directory/google"
-	"github.com/pomerium/pomerium/internal/directory/okta"
-	"github.com/pomerium/pomerium/internal/directory/onelogin"
+	"github.com/pomerium/csrf"
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	"github.com/pomerium/pomerium/internal/hashutil"
-	"github.com/pomerium/pomerium/internal/identity/oauth"
+	"github.com/pomerium/pomerium/internal/httputil"
 	"github.com/pomerium/pomerium/internal/log"
-	"github.com/pomerium/pomerium/internal/sets"
 	"github.com/pomerium/pomerium/internal/telemetry"
 	"github.com/pomerium/pomerium/internal/telemetry/metrics"
 	"github.com/pomerium/pomerium/internal/urlutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	"github.com/pomerium/pomerium/pkg/grpc/config"
+	"github.com/pomerium/pomerium/pkg/hpke"
+	"github.com/pomerium/pomerium/pkg/identity/oauth"
+	"github.com/pomerium/pomerium/pkg/identity/oauth/apple"
+	"github.com/pomerium/pomerium/pkg/policy/parser"
 )
 
 // DisableHeaderKey is the key used to check whether to disable setting header
 const DisableHeaderKey = "disable"
-
-const (
-	idpCustomScopesDocLink = "https://www.pomerium.io/reference/#identity-provider-scopes"
-	idpCustomScopesWarnMsg = "config: using custom scopes may result in undefined behavior, see: " + idpCustomScopesDocLink
-)
 
 // DefaultAlternativeAddr is the address used is two services are competing over
 // the same listener. Typically this is invisible to the end user (e.g. localhost)
@@ -58,20 +59,27 @@ type Options struct {
 	// InstallationID is used to indicate a unique installation of pomerium. Useful for telemetry.
 	InstallationID string `mapstructure:"installation_id" yaml:"installation_id,omitempty"`
 
-	// Debug outputs human-readable logs to Stdout.
+	// Debug is deprecated.
 	Debug bool `mapstructure:"pomerium_debug" yaml:"pomerium_debug,omitempty"`
 
 	// LogLevel sets the global override for log level. All Loggers will use at least this value.
 	// Possible options are "info","warn","debug" and "error". Defaults to "info".
-	LogLevel string `mapstructure:"log_level" yaml:"log_level,omitempty"`
+	LogLevel LogLevel `mapstructure:"log_level" yaml:"log_level,omitempty"`
 
 	// ProxyLogLevel sets the log level for the proxy service.
 	// Possible options are "info","warn", and "error". Defaults to the value of `LogLevel`.
-	ProxyLogLevel string `mapstructure:"proxy_log_level" yaml:"proxy_log_level,omitempty"`
+	ProxyLogLevel LogLevel `mapstructure:"proxy_log_level" yaml:"proxy_log_level,omitempty"`
+
+	// AccessLogFields are the fields to log in access logs.
+	AccessLogFields []log.AccessLogField `mapstructure:"access_log_fields" yaml:"access_log_fields,omitempty"`
+
+	// AuthorizeLogFields are the fields to log in authorize logs.
+	AuthorizeLogFields []log.AuthorizeLogField `mapstructure:"authorize_log_fields" yaml:"authorize_log_fields,omitempty"`
 
 	// SharedKey is the shared secret authorization key used to mutually authenticate
 	// requests between services.
-	SharedKey string `mapstructure:"shared_secret" yaml:"shared_secret,omitempty"`
+	SharedKey        string `mapstructure:"shared_secret" yaml:"shared_secret,omitempty"`
+	SharedSecretFile string `mapstructure:"shared_secret_file" yaml:"shared_secret_file,omitempty"`
 
 	// Services is a list enabled service mode. If none are selected, "all" is used.
 	// Available options are : "all", "authenticate", "proxy".
@@ -87,9 +95,10 @@ type Options struct {
 	InsecureServer bool `mapstructure:"insecure_server" yaml:"insecure_server,omitempty"`
 
 	// DNSLookupFamily is the DNS IP address resolution policy.
-	// If this setting is not specified, the value defaults to AUTO.
+	// If this setting is not specified, the value defaults to V4_PREFERRED.
 	DNSLookupFamily string `mapstructure:"dns_lookup_family" yaml:"dns_lookup_family,omitempty"`
 
+	CertificateData  []*config.Settings_Certificate
 	CertificateFiles []certificateFilePair `mapstructure:"certificates" yaml:"certificates,omitempty"`
 
 	// Cert and Key is the x509 certificate used to create the HTTPS server.
@@ -132,25 +141,22 @@ type Options struct {
 
 	// Session/Cookie management
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie
-	CookieName     string        `mapstructure:"cookie_name" yaml:"cookie_name,omitempty"`
-	CookieSecret   string        `mapstructure:"cookie_secret" yaml:"cookie_secret,omitempty"`
-	CookieDomain   string        `mapstructure:"cookie_domain" yaml:"cookie_domain,omitempty"`
-	CookieSecure   bool          `mapstructure:"cookie_secure" yaml:"cookie_secure,omitempty"`
-	CookieHTTPOnly bool          `mapstructure:"cookie_http_only" yaml:"cookie_http_only,omitempty"`
-	CookieExpire   time.Duration `mapstructure:"cookie_expire" yaml:"cookie_expire,omitempty"`
+	CookieName       string        `mapstructure:"cookie_name" yaml:"cookie_name,omitempty"`
+	CookieSecret     string        `mapstructure:"cookie_secret" yaml:"cookie_secret,omitempty"`
+	CookieSecretFile string        `mapstructure:"cookie_secret_file" yaml:"cookie_secret_file,omitempty"`
+	CookieDomain     string        `mapstructure:"cookie_domain" yaml:"cookie_domain,omitempty"`
+	CookieHTTPOnly   bool          `mapstructure:"cookie_http_only" yaml:"cookie_http_only,omitempty"`
+	CookieExpire     time.Duration `mapstructure:"cookie_expire" yaml:"cookie_expire,omitempty"`
+	CookieSameSite   string        `mapstructure:"cookie_same_site" yaml:"cookie_same_site,omitempty"`
 
 	// Identity provider configuration variables as specified by RFC6749
 	// https://openid.net/specs/openid-connect-basic-1_0.html#RFC6749
-	ClientID       string   `mapstructure:"idp_client_id" yaml:"idp_client_id,omitempty"`
-	ClientSecret   string   `mapstructure:"idp_client_secret" yaml:"idp_client_secret,omitempty"`
-	Provider       string   `mapstructure:"idp_provider" yaml:"idp_provider,omitempty"`
-	ProviderURL    string   `mapstructure:"idp_provider_url" yaml:"idp_provider_url,omitempty"`
-	Scopes         []string `mapstructure:"idp_scopes" yaml:"idp_scopes,omitempty"`
-	ServiceAccount string   `mapstructure:"idp_service_account" yaml:"idp_service_account,omitempty"`
-	// Identity provider refresh directory interval/timeout settings.
-	RefreshDirectoryTimeout  time.Duration `mapstructure:"idp_refresh_directory_timeout" yaml:"idp_refresh_directory_timeout,omitempty"`
-	RefreshDirectoryInterval time.Duration `mapstructure:"idp_refresh_directory_interval" yaml:"idp_refresh_directory_interval,omitempty"`
-	QPS                      float64       `mapstructure:"idp_qps" yaml:"idp_qps"`
+	ClientID         string   `mapstructure:"idp_client_id" yaml:"idp_client_id,omitempty"`
+	ClientSecret     string   `mapstructure:"idp_client_secret" yaml:"idp_client_secret,omitempty"`
+	ClientSecretFile string   `mapstructure:"idp_client_secret_file" yaml:"idp_client_secret_file,omitempty"`
+	Provider         string   `mapstructure:"idp_provider" yaml:"idp_provider,omitempty"`
+	ProviderURL      string   `mapstructure:"idp_provider_url" yaml:"idp_provider_url,omitempty"`
+	Scopes           []string `mapstructure:"idp_scopes" yaml:"idp_scopes,omitempty"`
 
 	// RequestParams are custom request params added to the signin request as
 	// part of an Oauth2 code flow.
@@ -171,9 +177,14 @@ type Options struct {
 	CA                      string `mapstructure:"certificate_authority" yaml:"certificate_authority,omitempty"`
 	CAFile                  string `mapstructure:"certificate_authority_file" yaml:"certificate_authority_file,omitempty"`
 
+	// DeriveInternalDomainCert is an option that would derive certificate authority
+	// and domain certificates from the shared key and use them for internal communication
+	DeriveInternalDomainCert *string `mapstructure:"tls_derive" yaml:"tls_derive,omitempty"`
+
 	// SigningKey is the private key used to add a JWT-signature to upstream requests.
-	// https://www.pomerium.io/docs/topics/getting-users-identity.html
-	SigningKey string `mapstructure:"signing_key" yaml:"signing_key,omitempty"`
+	// https://www.pomerium.com/docs/topics/getting-users-identity.html
+	SigningKey     string `mapstructure:"signing_key" yaml:"signing_key,omitempty"`
+	SigningKeyFile string `mapstructure:"signing_key_file" yaml:"signing_key_file,omitempty"`
 
 	HeadersEnv string `yaml:",omitempty"`
 	// SetResponseHeaders to set on all proxied requests. Add a 'disable' key map to turn off.
@@ -181,6 +192,9 @@ type Options struct {
 
 	// List of JWT claims to insert as x-pomerium-claim-* headers on proxied requests
 	JWTClaimsHeaders JWTClaimHeaders `mapstructure:"jwt_claims_headers" yaml:"jwt_claims_headers,omitempty"`
+
+	// Allowlist of group names/IDs to include in the Pomerium JWT.
+	JWTGroupsFilter JWTGroupsFilter
 
 	DefaultUpstreamTimeout time.Duration `mapstructure:"default_upstream_timeout" yaml:"default_upstream_timeout,omitempty"`
 
@@ -197,8 +211,11 @@ type Options struct {
 	MetricsClientCAFile       string `mapstructure:"metrics_client_ca_file" yaml:"metrics_client_ca_file,omitempty"`
 
 	// Tracing shared settings
-	TracingProvider   string  `mapstructure:"tracing_provider" yaml:"tracing_provider,omitempty"`
-	TracingSampleRate float64 `mapstructure:"tracing_sample_rate" yaml:"tracing_sample_rate,omitempty"`
+	TracingProvider   string   `mapstructure:"tracing_provider" yaml:"tracing_provider,omitempty"`
+	TracingSampleRate *float64 `mapstructure:"tracing_sample_rate" yaml:"tracing_sample_rate,omitempty"`
+
+	TracingOTLPEndpoint string `mapstructure:"tracing_otlp_endpoint" yaml:"tracing_otlp_endpoint,omitempty"`
+	TracingOTLPProtocol string `mapstructure:"tracing_otlp_protocol" yaml:"tracing_otlp_protocol,omitempty"`
 
 	// Datadog tracing address
 	TracingDatadogAddress string `mapstructure:"tracing_datadog_address" yaml:"tracing_datadog_address,omitempty"`
@@ -226,45 +243,27 @@ type Options struct {
 
 	// GRPCInsecure disables transport security.
 	// If running in all-in-one mode, defaults to true.
-	GRPCInsecure bool `mapstructure:"grpc_insecure" yaml:"grpc_insecure,omitempty"`
+	GRPCInsecure *bool `mapstructure:"grpc_insecure" yaml:"grpc_insecure,omitempty"`
 
-	GRPCClientTimeout       time.Duration `mapstructure:"grpc_client_timeout" yaml:"grpc_client_timeout,omitempty"`
-	GRPCClientDNSRoundRobin bool          `mapstructure:"grpc_client_dns_roundrobin" yaml:"grpc_client_dns_roundrobin,omitempty"`
+	GRPCClientTimeout time.Duration `mapstructure:"grpc_client_timeout" yaml:"grpc_client_timeout,omitempty"`
 
-	// ForwardAuthEndpoint allows for a given route to be used as a forward-auth
-	// endpoint instead of a reverse proxy. Some third-party proxies that do not
-	// have rich access control capabilities (nginx, envoy, ambassador, traefik)
-	// allow you to delegate and authenticate each request to your website
-	// with an external server or service. Pomerium can be configured to accept
-	// these requests with this switch
-	ForwardAuthURLString string `mapstructure:"forward_auth_url" yaml:"forward_auth_url,omitempty"`
-
-	// DataBrokerURLString is the routable destination of the databroker service's gRPC endpiont.
+	// DataBrokerURLString is the routable destination of the databroker service's gRPC endpoint.
 	DataBrokerURLString         string   `mapstructure:"databroker_service_url" yaml:"databroker_service_url,omitempty"`
 	DataBrokerURLStrings        []string `mapstructure:"databroker_service_urls" yaml:"databroker_service_urls,omitempty"`
 	DataBrokerInternalURLString string   `mapstructure:"databroker_internal_service_url" yaml:"databroker_internal_service_url,omitempty"`
 	// DataBrokerStorageType is the storage backend type that databroker will use.
-	// Supported type: memory, redis
+	// Supported type: memory, postgres
 	DataBrokerStorageType string `mapstructure:"databroker_storage_type" yaml:"databroker_storage_type,omitempty"`
 	// DataBrokerStorageConnectionString is the data source name for storage backend.
-	DataBrokerStorageConnectionString string `mapstructure:"databroker_storage_connection_string" yaml:"databroker_storage_connection_string,omitempty"`
-	DataBrokerStorageCertFile         string `mapstructure:"databroker_storage_cert_file" yaml:"databroker_storage_cert_file,omitempty"`
-	DataBrokerStorageCertKeyFile      string `mapstructure:"databroker_storage_key_file" yaml:"databroker_storage_key_file,omitempty"`
-	DataBrokerStorageCAFile           string `mapstructure:"databroker_storage_ca_file" yaml:"databroker_storage_ca_file,omitempty"`
-	DataBrokerStorageCertSkipVerify   bool   `mapstructure:"databroker_storage_tls_skip_verify" yaml:"databroker_storage_tls_skip_verify,omitempty"`
+	DataBrokerStorageConnectionString     string `mapstructure:"databroker_storage_connection_string" yaml:"databroker_storage_connection_string,omitempty"`
+	DataBrokerStorageConnectionStringFile string `mapstructure:"databroker_storage_connection_string_file" yaml:"databroker_storage_connection_string_file,omitempty"`
 
-	// ClientCA is the base64-encoded certificate authority to validate client mTLS certificates against.
-	ClientCA string `mapstructure:"client_ca" yaml:"client_ca,omitempty"`
-	// ClientCAFile points to a file that contains the certificate authority to validate client mTLS certificates against.
-	ClientCAFile string `mapstructure:"client_ca_file" yaml:"client_ca_file,omitempty"`
-	// ClientCRL is the base64-encoded certificate revocation list for client mTLS certificates.
-	ClientCRL string `mapstructure:"client_crl" yaml:"client_crl,omitempty"`
-	// ClientCRLFile points to a file that contains the certificate revocation list for client mTLS certificates.
-	ClientCRLFile string `mapstructure:"client_crl_file" yaml:"client_crl_file,omitempty"`
+	// DownstreamMTLS holds all downstream mTLS settings.
+	DownstreamMTLS DownstreamMTLSSettings `mapstructure:"downstream_mtls" yaml:"downstream_mtls,omitempty"`
 
 	// GoogleCloudServerlessAuthenticationServiceAccount is the service account to use for GCP serverless authentication.
 	// If unset, the GCP metadata server will be used to query for identity tokens.
-	GoogleCloudServerlessAuthenticationServiceAccount string `mapstructure:"google_cloud_serverless_authentication_service_account" yaml:"google_cloud_serverless_authentication_service_account,omitempty"` //nolint
+	GoogleCloudServerlessAuthenticationServiceAccount string `mapstructure:"google_cloud_serverless_authentication_service_account" yaml:"google_cloud_serverless_authentication_service_account,omitempty"`
 
 	// UseProxyProtocol configures the HTTP listener to require the HAProxy proxy protocol (either v1 or v2) on incoming requests.
 	UseProxyProtocol bool `mapstructure:"use_proxy_protocol" yaml:"use_proxy_protocol,omitempty" json:"use_proxy_protocol,omitempty"`
@@ -288,12 +287,16 @@ type Options struct {
 	EnvoyBindConfigFreebind      null.Bool `mapstructure:"envoy_bind_config_freebind" yaml:"envoy_bind_config_freebind,omitempty"`
 
 	// ProgrammaticRedirectDomainWhitelist restricts the allowed redirect URLs when using programmatic login.
-	ProgrammaticRedirectDomainWhitelist []string `mapstructure:"programmatic_redirect_domain_whitelist" yaml:"programmatic_redirect_domain_whitelist,omitempty" json:"programmatic_redirect_domain_whitelist,omitempty"` //nolint
+	ProgrammaticRedirectDomainWhitelist []string `mapstructure:"programmatic_redirect_domain_whitelist" yaml:"programmatic_redirect_domain_whitelist,omitempty" json:"programmatic_redirect_domain_whitelist,omitempty"`
 
 	// CodecType is the codec to use for downstream connections.
 	CodecType CodecType `mapstructure:"codec_type" yaml:"codec_type"`
 
-	AuditKey *PublicKeyEncryptionKeyOptions `mapstructure:"audit_key"`
+	BrandingOptions httputil.BrandingOptions
+
+	PassIdentityHeaders *bool `mapstructure:"pass_identity_headers" yaml:"pass_identity_headers"`
+
+	RuntimeFlags RuntimeFlags `mapstructure:"runtime_flags" yaml:"runtime_flags,omitempty"`
 }
 
 type certificateFilePair struct {
@@ -304,31 +307,19 @@ type certificateFilePair struct {
 
 // DefaultOptions are the default configuration options for pomerium
 var defaultOptions = Options{
-	Debug:                  false,
-	LogLevel:               "info",
-	Services:               "all",
-	CookieHTTPOnly:         true,
-	CookieSecure:           true,
-	CookieExpire:           14 * time.Hour,
-	CookieName:             "_pomerium",
-	DefaultUpstreamTimeout: 30 * time.Second,
-	SetResponseHeaders: map[string]string{
-		"X-Frame-Options":           "SAMEORIGIN",
-		"X-XSS-Protection":          "1; mode=block",
-		"Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
-	},
+	LogLevel:                 LogLevelInfo,
+	Services:                 "all",
+	CookieHTTPOnly:           true,
+	CookieExpire:             14 * time.Hour,
+	CookieName:               "_pomerium",
+	DefaultUpstreamTimeout:   30 * time.Second,
 	Addr:                     ":443",
 	ReadTimeout:              30 * time.Second,
 	WriteTimeout:             0, // support streaming by default
 	IdleTimeout:              5 * time.Minute,
 	GRPCAddr:                 ":443",
 	GRPCClientTimeout:        10 * time.Second, // Try to withstand transient service failures for a single request
-	GRPCClientDNSRoundRobin:  true,
 	AuthenticateCallbackPath: "/oauth2/callback",
-	TracingSampleRate:        0.0001,
-	RefreshDirectoryInterval: 10 * time.Minute,
-	RefreshDirectoryTimeout:  1 * time.Minute,
-	QPS:                      1.0,
 
 	AutocertOptions: AutocertOptions{
 		Folder: dataDir(),
@@ -338,14 +329,25 @@ var defaultOptions = Options{
 	XffNumTrustedHops:                   0,
 	EnvoyAdminAccessLogPath:             os.DevNull,
 	EnvoyAdminProfilePath:               os.DevNull,
-	EnvoyAdminAddress:                   "127.0.0.1:9901",
 	ProgrammaticRedirectDomainWhitelist: []string{"localhost"},
+}
+
+// IsRuntimeFlagSet returns true if the runtime flag is sets
+func (o *Options) IsRuntimeFlagSet(flag RuntimeFlag) bool {
+	return o.RuntimeFlags[flag]
+}
+
+var defaultSetResponseHeaders = map[string]string{
+	"X-Frame-Options":           "SAMEORIGIN",
+	"X-XSS-Protection":          "1; mode=block",
+	"Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
 }
 
 // NewDefaultOptions returns a copy the default options. It's the caller's
 // responsibility to do a follow up Validate call.
 func NewDefaultOptions() *Options {
 	newOpts := defaultOptions
+	newOpts.RuntimeFlags = DefaultRuntimeFlags()
 	newOpts.viper = viper.New()
 	return &newOpts
 }
@@ -359,7 +361,7 @@ func newOptionsFromConfig(configFile string) (*Options, error) {
 	}
 	serviceName := telemetry.ServiceName(o.Services)
 	metrics.AddPolicyCountCallback(serviceName, func() int64 {
-		return int64(len(o.GetAllPolicies()))
+		return int64(o.NumPolicies())
 	})
 
 	return o, nil
@@ -370,7 +372,7 @@ func optionsFromViper(configFile string) (*Options, error) {
 	o := NewDefaultOptions()
 	v := o.viper
 	// Load up config
-	err := bindEnvs(o, v)
+	err := bindEnvs(v)
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind options to env vars: %w", err)
 	}
@@ -386,7 +388,9 @@ func optionsFromViper(configFile string) (*Options, error) {
 	if err := v.Unmarshal(o, ViperPolicyHooks, func(c *mapstructure.DecoderConfig) { c.Metadata = &metadata }); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
-	checkUnusedConfigFields(configFile, metadata.Unused)
+	if err := checkConfigKeysErrors(configFile, o, metadata.Unused); err != nil {
+		return nil, err
+	}
 
 	// This is necessary because v.Unmarshal will overwrite .viper field.
 	o.viper = v
@@ -397,17 +401,36 @@ func optionsFromViper(configFile string) (*Options, error) {
 	return o, nil
 }
 
-func checkUnusedConfigFields(configFile string, unused []string) {
-	keys := make([]string, 0, len(unused))
-	for _, k := range unused {
-		if !strings.HasPrefix(k, "policy[") { // policy's embedded protobuf structs are decoded by separate hook and are unknown to mapstructure
-			keys = append(keys, k)
+func checkConfigKeysErrors(configFile string, o *Options, unused []string) error {
+	checks := CheckUnknownConfigFields(unused)
+	ctx := context.Background()
+	errInvalidConfigKeys := errors.New("some configuration options are no longer supported, please check logs for details")
+	var err error
+
+	for _, check := range checks {
+		var evt *zerolog.Event
+		switch check.KeyAction {
+		case KeyActionError:
+			evt = log.Ctx(ctx).Error()
+			err = errInvalidConfigKeys
+		default:
+			evt = log.Ctx(ctx).Error()
+		}
+		evt.Str("config_file", configFile).Str("key", check.Key)
+		if check.DocsURL != "" {
+			evt = evt.Str("help", check.DocsURL)
+		}
+		evt.Msg(string(check.FieldCheckMsg))
+	}
+
+	// check for unknown runtime flags
+	for flag := range o.RuntimeFlags {
+		if _, ok := defaultRuntimeFlags[flag]; !ok {
+			log.Ctx(ctx).Error().Str("config_file", configFile).Str("flag", string(flag)).Msg("unknown runtime flag")
 		}
 	}
-	if len(keys) == 0 {
-		return
-	}
-	log.Warn(context.Background()).Str("config_file", configFile).Strs("keys", keys).Msg("config contained unknown keys that were ignored")
+
+	return err
 }
 
 // parsePolicy initializes policy to the options from either base64 environmental
@@ -443,7 +466,7 @@ func (o *Options) parsePolicy() error {
 		}
 	}
 	for i := range o.AdditionalPolicies {
-		p := &o.AdditionalPolicies[i]
+		p := o.AdditionalPolicies[i]
 		if err := p.Validate(); err != nil {
 			return err
 		}
@@ -451,7 +474,7 @@ func (o *Options) parsePolicy() error {
 	return nil
 }
 
-func (o *Options) viperSet(key string, value interface{}) {
+func (o *Options) viperSet(key string, value any) {
 	o.viper.Set(key, value)
 }
 
@@ -461,7 +484,7 @@ func (o *Options) viperIsSet(key string) bool {
 
 // parseHeaders handles unmarshalling any custom headers correctly from the
 // environment or viper's parsed keys
-func (o *Options) parseHeaders(ctx context.Context) error {
+func (o *Options) parseHeaders(_ context.Context) error {
 	var headers map[string]string
 	if o.HeadersEnv != "" {
 		// Handle JSON by default via viper
@@ -492,20 +515,11 @@ func (o *Options) parseHeaders(ctx context.Context) error {
 	return nil
 }
 
-// bindEnvs binds a viper instance to each env var of an Options struct based
-// on the mapstructure tag
-func bindEnvs(o *Options, v *viper.Viper) error {
-	tagName := `mapstructure`
-	t := reflect.TypeOf(*o)
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		envName := field.Tag.Get(tagName)
-		err := v.BindEnv(envName)
-		if err != nil {
-			return fmt.Errorf("failed to bind field '%s' to env var '%s': %w", field.Name, envName, err)
-		}
-
+// bindEnvs adds a Viper environment variable binding for each field in the
+// Options struct (including nested structs), based on the mapstructure tag.
+func bindEnvs(v *viper.Viper) error {
+	if _, err := bindEnvsRecursive(reflect.TypeOf(Options{}), v, "", ""); err != nil {
+		return err
 	}
 
 	// Statically bind fields
@@ -517,18 +531,54 @@ func bindEnvs(o *Options, v *viper.Viper) error {
 	if err != nil {
 		return fmt.Errorf("failed to bind field 'HeadersEnv' to env var 'HEADERS': %w", err)
 	}
-	// autocert options
-	ao := reflect.TypeOf(o.AutocertOptions)
-	for i := 0; i < ao.NumField(); i++ {
-		field := ao.Field(i)
-		envName := field.Tag.Get(tagName)
-		err := v.BindEnv(envName)
-		if err != nil {
-			return fmt.Errorf("failed to bind field '%s' to env var '%s': %w", field.Name, envName, err)
-		}
-	}
 
 	return nil
+}
+
+// bindEnvsRecursive binds all fields of the provided struct type that have a
+// "mapstructure" tag to corresponding environment variables, recursively. If a
+// nested struct contains no fields with a "mapstructure" tag, a binding will
+// be added for the struct itself (e.g. null.Bool).
+func bindEnvsRecursive(t reflect.Type, v *viper.Viper, keyPrefix, envPrefix string) (bool, error) {
+	anyFieldHasMapstructureTag := false
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		tag, hasTag := field.Tag.Lookup("mapstructure")
+		if !hasTag || tag == "-" {
+			continue
+		}
+
+		anyFieldHasMapstructureTag = true
+
+		key, _, _ := strings.Cut(tag, ",")
+		keyPath := keyPrefix + key
+		envName := envPrefix + strings.ToUpper(key)
+
+		if field.Type.Kind() == reflect.Struct {
+			newKeyPrefix := keyPath
+			newEnvPrefix := envName
+			if key != "" {
+				newKeyPrefix += "."
+				newEnvPrefix += "_"
+			}
+			nestedMapstructure, err := bindEnvsRecursive(field.Type, v, newKeyPrefix, newEnvPrefix)
+			if err != nil {
+				return false, err
+			} else if nestedMapstructure {
+				// If we've bound any nested fields from this struct, do not
+				// also bind this struct itself.
+				continue
+			}
+		}
+
+		if key != "" {
+			if err := v.BindEnv(keyPath, envName); err != nil {
+				return false, fmt.Errorf("failed to bind field '%s' to env var '%s': %w",
+					field.Name, envName, err)
+			}
+		}
+	}
+	return anyFieldHasMapstructureTag, nil
 }
 
 // Validate ensures the Options fields are valid, and hydrated.
@@ -540,8 +590,8 @@ func (o *Options) Validate() error {
 
 	switch o.DataBrokerStorageType {
 	case StorageInMemoryName:
-	case StorageRedisName:
-		if o.DataBrokerStorageConnectionString == "" {
+	case StoragePostgresName:
+		if o.DataBrokerStorageConnectionString == "" && o.DataBrokerStorageConnectionStringFile == "" {
 			return errors.New("config: missing databroker storage backend dsn")
 		}
 	default:
@@ -599,13 +649,6 @@ func (o *Options) Validate() error {
 		}
 	}
 
-	if o.ForwardAuthURLString != "" {
-		_, err := urlutil.ParseAndValidateURL(o.ForwardAuthURLString)
-		if err != nil {
-			return fmt.Errorf("config: bad forward-auth-url %s : %w", o.ForwardAuthURLString, err)
-		}
-	}
-
 	if o.PolicyFile != "" {
 		return errors.New("config: policy file setting is deprecated")
 	}
@@ -627,13 +670,18 @@ func (o *Options) Validate() error {
 		hasCert = true
 	}
 
-	for _, c := range o.CertificateFiles {
-		_, err := cryptutil.CertificateFromBase64(c.CertFile, c.KeyFile)
+	for _, c := range o.CertificateData {
+		_, err := tls.X509KeyPair(c.GetCertBytes(), c.GetKeyBytes())
 		if err != nil {
-			_, err = cryptutil.CertificateFromFile(c.CertFile, c.KeyFile)
+			return fmt.Errorf("config: bad cert entry, cert is invalid: %w", err)
 		}
+		hasCert = true
+	}
+
+	for _, c := range o.CertificateFiles {
+		_, err := cryptutil.CertificateFromFile(c.CertFile, c.KeyFile)
 		if err != nil {
-			return fmt.Errorf("config: bad cert entry, base64 or file reference invalid. %w", err)
+			return fmt.Errorf("config: bad cert entry, file reference invalid. %w", err)
 		}
 		hasCert = true
 	}
@@ -646,71 +694,16 @@ func (o *Options) Validate() error {
 		hasCert = true
 	}
 
-	if o.DataBrokerStorageCertFile != "" || o.DataBrokerStorageCertKeyFile != "" {
-		_, err := cryptutil.CertificateFromFile(o.DataBrokerStorageCertFile, o.DataBrokerStorageCertKeyFile)
-		if err != nil {
-			return fmt.Errorf("config: bad databroker cert file %w", err)
-		}
-	}
-
-	if o.DataBrokerStorageCAFile != "" {
-		if _, err := os.Stat(o.DataBrokerStorageCAFile); err != nil {
-			return fmt.Errorf("config: bad databroker ca file: %w", err)
-		}
-	}
-
-	if o.ClientCA != "" {
-		if _, err := base64.StdEncoding.DecodeString(o.ClientCA); err != nil {
-			return fmt.Errorf("config: bad client ca base64: %w", err)
-		}
-	}
-
-	if o.ClientCAFile != "" {
-		_, err := os.ReadFile(o.ClientCAFile)
-		if err != nil {
-			return fmt.Errorf("config: bad client ca file: %w", err)
-		}
-	}
-
-	if o.ClientCRL != "" {
-		_, err = cryptutil.CRLFromBase64(o.ClientCRL)
-		if err != nil {
-			return fmt.Errorf("config: bad client crl base64: %w", err)
-		}
-	}
-
-	if o.ClientCRLFile != "" {
-		_, err = cryptutil.CRLFromFile(o.ClientCRLFile)
-		if err != nil {
-			return fmt.Errorf("config: bad client crl file: %w", err)
-		}
-	}
-
-	// if no service account was defined, there should not be any policies that
-	// assert group membership (except for azure which can be derived from the client
-	// id, secret and provider url)
-	if o.ServiceAccount == "" && o.Provider != "azure" {
-		for _, p := range o.GetAllPolicies() {
-			if len(p.AllowedGroups) != 0 {
-				return fmt.Errorf("config: `allowed_groups` requires `idp_service_account`")
-			}
-		}
+	if err := o.DownstreamMTLS.validate(); err != nil {
+		return fmt.Errorf("config: bad downstream mTLS settings: %w", err)
 	}
 
 	// strip quotes from redirect address (#811)
 	o.HTTPRedirectAddr = strings.Trim(o.HTTPRedirectAddr, `"'`)
 
 	if !o.InsecureServer && !hasCert && !o.AutocertOptions.Enable {
-		log.Warn(ctx).Msg("neither `autocert`, " +
+		log.Ctx(ctx).Info().Msg("neither `autocert`, " +
 			"`insecure_server` or manually provided certificates were provided, server will be using a self-signed certificate")
-	}
-
-	switch o.Provider {
-	case azure.Name, github.Name, gitlab.Name, google.Name, okta.Name, onelogin.Name:
-		if len(o.Scopes) > 0 {
-			log.Warn(ctx).Msg(idpCustomScopesWarnMsg)
-		}
-	default:
 	}
 
 	if err := ValidateDNSLookupFamily(o.DNSLookupFamily); err != nil {
@@ -755,25 +748,94 @@ func (o *Options) Validate() error {
 		return err
 	}
 
+	if err := ValidateCookieSameSite(o.CookieSameSite); err != nil {
+		return fmt.Errorf("config: invalid cookie_same_site: %w", err)
+	}
+
+	if err := ValidateLogLevel(o.LogLevel); err != nil {
+		return fmt.Errorf("config: invalid log_level: %w", err)
+	}
+
+	if err := ValidateLogLevel(o.ProxyLogLevel); err != nil {
+		return fmt.Errorf("config: invalid proxy_log_level: %w", err)
+	}
+
+	for _, field := range o.AccessLogFields {
+		if err := field.Validate(); err != nil {
+			return fmt.Errorf("config: invalid access_log_fields: %w", err)
+		}
+	}
+
+	for _, field := range o.AuthorizeLogFields {
+		if err := field.Validate(); err != nil {
+			return fmt.Errorf("config: invalid authorize_log_fields: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// GetDeriveInternalDomain returns an optional internal domain name to use for gRPC endpoint
+func (o *Options) GetDeriveInternalDomain() string {
+	if o.DeriveInternalDomainCert == nil {
+		return ""
+	}
+	return strings.ToLower(*o.DeriveInternalDomainCert)
 }
 
 // GetAuthenticateURL returns the AuthenticateURL in the options or 127.0.0.1.
 func (o *Options) GetAuthenticateURL() (*url.URL, error) {
-	rawurl := o.AuthenticateURLString
-	if rawurl == "" {
-		rawurl = "https://127.0.0.1"
+	rawURL := o.AuthenticateURLString
+	if rawURL == "" {
+		rawURL = "https://authenticate.pomerium.app"
 	}
-	return urlutil.ParseAndValidateURL(rawurl)
+	return urlutil.ParseAndValidateURL(rawURL)
 }
 
 // GetInternalAuthenticateURL returns the internal AuthenticateURL in the options or the AuthenticateURL.
 func (o *Options) GetInternalAuthenticateURL() (*url.URL, error) {
-	rawurl := o.AuthenticateInternalURLString
-	if rawurl == "" {
+	rawURL := o.AuthenticateInternalURLString
+	if rawURL == "" {
 		return o.GetAuthenticateURL()
 	}
 	return urlutil.ParseAndValidateURL(o.AuthenticateInternalURLString)
+}
+
+// UseStatelessAuthenticateFlow returns true if the stateless authentication
+// flow should be used (i.e. for hosted authenticate).
+func (o *Options) UseStatelessAuthenticateFlow() bool {
+	if flow := os.Getenv("DEBUG_FORCE_AUTHENTICATE_FLOW"); flow != "" {
+		if flow == "stateless" {
+			return true
+		} else if flow == "stateful" {
+			return false
+		}
+		log.Error().
+			Msgf("ignoring unknown DEBUG_FORCE_AUTHENTICATE_FLOW setting %q", flow)
+	}
+	u, err := o.GetInternalAuthenticateURL()
+	if err != nil {
+		return false
+	}
+	return urlutil.IsHostedAuthenticateDomain(u.Hostname())
+}
+
+// SupportsUserRefresh returns true if the config options support refreshing of user sessions.
+func (o *Options) SupportsUserRefresh() bool {
+	if o == nil {
+		return false
+	}
+
+	if o.Provider == "" {
+		return false
+	}
+
+	u, err := o.GetInternalAuthenticateURL()
+	if err != nil {
+		return false
+	}
+
+	return !urlutil.IsHostedAuthenticateDomain(u.Hostname())
 }
 
 // GetAuthorizeURLs returns the AuthorizeURLs in the options or 127.0.0.1:5443.
@@ -839,15 +901,6 @@ func (o *Options) getURLs(strs ...string) ([]*url.URL, error) {
 	return urls, nil
 }
 
-// GetForwardAuthURL returns the ForwardAuthURL.
-func (o *Options) GetForwardAuthURL() (*url.URL, error) {
-	rawurl := o.ForwardAuthURLString
-	if rawurl == "" {
-		return nil, nil
-	}
-	return urlutil.ParseAndValidateURL(rawurl)
-}
-
 // GetGRPCAddr gets the gRPC address.
 func (o *Options) GetGRPCAddr() string {
 	// to avoid port collision when running on localhost
@@ -859,10 +912,13 @@ func (o *Options) GetGRPCAddr() string {
 
 // GetGRPCInsecure gets whether or not gRPC is insecure.
 func (o *Options) GetGRPCInsecure() bool {
+	if o.GRPCInsecure != nil {
+		return *o.GRPCInsecure
+	}
 	if IsAll(o.Services) {
 		return true
 	}
-	return o.GRPCInsecure
+	return false
 }
 
 // GetSignOutRedirectURL gets the SignOutRedirectURL.
@@ -895,27 +951,76 @@ func (o *Options) GetOauthOptions() (oauth.Options, error) {
 	redirectURL = redirectURL.ResolveReference(&url.URL{
 		Path: o.AuthenticateCallbackPath,
 	})
+	clientSecret, err := o.GetClientSecret()
+	if err != nil {
+		return oauth.Options{}, err
+	}
 	return oauth.Options{
-		RedirectURL:    redirectURL,
-		ProviderName:   o.Provider,
-		ProviderURL:    o.ProviderURL,
-		ClientID:       o.ClientID,
-		ClientSecret:   o.ClientSecret,
-		Scopes:         o.Scopes,
-		ServiceAccount: o.ServiceAccount,
+		RedirectURL:  redirectURL,
+		ProviderName: o.Provider,
+		ProviderURL:  o.ProviderURL,
+		ClientID:     o.ClientID,
+		ClientSecret: clientSecret,
+		Scopes:       o.Scopes,
 	}, nil
 }
 
 // GetAllPolicies gets all the policies in the options.
-func (o *Options) GetAllPolicies() []Policy {
-	if o == nil {
-		return nil
+func (o *Options) GetAllPolicies() iter.Seq[*Policy] {
+	return func(yield func(*Policy) bool) {
+		if o == nil {
+			return
+		}
+		for i := range len(o.Policies) {
+			if !yield(&o.Policies[i]) {
+				return
+			}
+		}
+		for i := range len(o.Routes) {
+			if !yield(&o.Routes[i]) {
+				return
+			}
+		}
+		for i := range len(o.AdditionalPolicies) {
+			if !yield(&o.AdditionalPolicies[i]) {
+				return
+			}
+		}
 	}
-	policies := make([]Policy, 0, len(o.Policies)+len(o.Routes)+len(o.AdditionalPolicies))
-	policies = append(policies, o.Policies...)
-	policies = append(policies, o.Routes...)
-	policies = append(policies, o.AdditionalPolicies...)
-	return policies
+}
+
+// GetAllPolicies gets all the policies in the options.
+func (o *Options) GetAllPoliciesIndexed() iter.Seq2[int, *Policy] {
+	return func(yield func(int, *Policy) bool) {
+		if o == nil {
+			return
+		}
+		index := 0
+		nextIndex := func() int {
+			i := index
+			index++
+			return i
+		}
+		for i := range len(o.Policies) {
+			if !yield(nextIndex(), &o.Policies[i]) {
+				return
+			}
+		}
+		for i := range len(o.Routes) {
+			if !yield(nextIndex(), &o.Routes[i]) {
+				return
+			}
+		}
+		for i := range len(o.AdditionalPolicies) {
+			if !yield(nextIndex(), &o.AdditionalPolicies[i]) {
+				return
+			}
+		}
+	}
+}
+
+func (o *Options) NumPolicies() int {
+	return len(o.Policies) + len(o.Routes) + len(o.AdditionalPolicies)
 }
 
 // GetMetricsBasicAuth gets the metrics basic auth username and password.
@@ -937,25 +1042,34 @@ func (o *Options) GetMetricsBasicAuth() (username, password string, ok bool) {
 	return string(bs[:idx]), string(bs[idx+1:]), true
 }
 
-// GetClientCA returns the client certificate authority. If neither client_ca nor client_ca_file is specified nil will
-// be returned.
-func (o *Options) GetClientCA() ([]byte, error) {
-	if o.ClientCA != "" {
-		return base64.StdEncoding.DecodeString(o.ClientCA)
+// HasAnyDownstreamMTLSClientCA returns true if there is a global downstream
+// client CA or there are any per-route downstream client CAs.
+func (o *Options) HasAnyDownstreamMTLSClientCA() bool {
+	// All the CA settings should already have been validated.
+	ca, _ := o.DownstreamMTLS.GetCA()
+	if len(ca) > 0 {
+		return true
 	}
-	if o.ClientCAFile != "" {
-		return os.ReadFile(o.ClientCAFile)
+	for p := range o.GetAllPolicies() {
+		// We don't need to check TLSDownstreamClientCAFile here because
+		// Policy.Validate() will populate TLSDownstreamClientCA when
+		// TLSDownstreamClientCAFile is set.
+		if p.TLSDownstreamClientCA != "" {
+			return true
+		}
 	}
-	return nil, nil
+	return false
 }
 
-// GetDataBrokerCertificate gets the optional databroker certificate. This method will return nil if no certificate is
-// specified.
-func (o *Options) GetDataBrokerCertificate() (*tls.Certificate, error) {
-	if o.DataBrokerStorageCertFile == "" || o.DataBrokerStorageCertKeyFile == "" {
-		return nil, nil
+// GetDataBrokerStorageConnectionString gets the databroker storage connection string from either a file
+// or the config option directly. If from a file spaces are trimmed off the ends.
+func (o *Options) GetDataBrokerStorageConnectionString() (string, error) {
+	if o.DataBrokerStorageConnectionStringFile != "" {
+		bs, err := os.ReadFile(o.DataBrokerStorageConnectionStringFile)
+		return strings.TrimSpace(string(bs)), err
 	}
-	return cryptutil.CertificateFromFile(o.DataBrokerStorageCertFile, o.DataBrokerStorageCertKeyFile)
+
+	return o.DataBrokerStorageConnectionString, nil
 }
 
 // GetCertificates gets all the certificates from the options.
@@ -969,14 +1083,18 @@ func (o *Options) GetCertificates() ([]tls.Certificate, error) {
 		certs = append(certs, *cert)
 	}
 	for _, c := range o.CertificateFiles {
-		cert, err := cryptutil.CertificateFromBase64(c.CertFile, c.KeyFile)
-		if err != nil {
-			cert, err = cryptutil.CertificateFromFile(c.CertFile, c.KeyFile)
-		}
+		cert, err := cryptutil.CertificateFromFile(c.CertFile, c.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("config: invalid certificate entry: %w", err)
 		}
 		certs = append(certs, *cert)
+	}
+	for _, c := range o.CertificateData {
+		cert, err := tls.X509KeyPair(c.GetCertBytes(), c.GetKeyBytes())
+		if err != nil {
+			return nil, fmt.Errorf("config: invalid certificate entry: %w", err)
+		}
+		certs = append(certs, cert)
 	}
 	if o.CertFile != "" && o.KeyFile != "" {
 		cert, err := cryptutil.CertificateFromFile(o.CertFile, o.KeyFile)
@@ -988,11 +1106,68 @@ func (o *Options) GetCertificates() ([]tls.Certificate, error) {
 	return certs, nil
 }
 
+// HasCertificates returns true if options has any certificates.
+func (o *Options) HasCertificates() bool {
+	return o.Cert != "" ||
+		o.Key != "" ||
+		len(o.CertificateFiles) > 0 ||
+		o.CertFile != "" ||
+		o.KeyFile != "" ||
+		len(o.CertificateData) > 0
+}
+
+// GetX509Certificates gets all the x509 certificates from the options. Invalid certificates are ignored.
+func (o *Options) GetX509Certificates() []*x509.Certificate {
+	var certs []*x509.Certificate
+
+	if o.CertFile != "" {
+		cert, err := cryptutil.ParsePEMCertificateFromFile(o.CertFile)
+		if err != nil {
+			log.Error().Err(err).Str("file", o.CertFile).Msg("invalid cert_file")
+		} else {
+			certs = append(certs, cert)
+		}
+	} else if o.Cert != "" {
+		if cert, err := cryptutil.ParsePEMCertificateFromBase64(o.Cert); err != nil {
+			log.Error().Err(err).Msg("invalid cert")
+		} else {
+			certs = append(certs, cert)
+		}
+	}
+
+	for _, c := range o.CertificateData {
+		cert, err := cryptutil.ParsePEMCertificate(c.GetCertBytes())
+		if err != nil {
+			log.Error().Err(err).Msg("invalid certificate")
+		} else {
+			certs = append(certs, cert)
+		}
+	}
+
+	for _, c := range o.CertificateFiles {
+		cert, err := cryptutil.ParsePEMCertificateFromFile(c.CertFile)
+		if err != nil {
+			log.Error().Err(err).Msg("invalid certificate_file")
+		} else {
+			certs = append(certs, cert)
+		}
+	}
+
+	return certs
+}
+
 // GetSharedKey gets the decoded shared key.
 func (o *Options) GetSharedKey() ([]byte, error) {
 	sharedKey := o.SharedKey
+	if o.SharedSecretFile != "" {
+		bs, err := os.ReadFile(o.SharedSecretFile)
+		if err != nil {
+			return nil, err
+		}
+		sharedKey = string(bs)
+	}
 	// mutual auth between services on the same host can be generated at runtime
-	if IsAll(o.Services) && o.SharedKey == "" && o.DataBrokerStorageType == StorageInMemoryName {
+	if IsAll(o.Services) && sharedKey == "" {
 		sharedKey = randomSharedKey
 	}
 	if sharedKey == "" {
@@ -1004,50 +1179,69 @@ func (o *Options) GetSharedKey() ([]byte, error) {
 	return base64.StdEncoding.DecodeString(sharedKey)
 }
 
+// GetHPKEPrivateKey gets the hpke.PrivateKey dervived from the shared key.
+func (o *Options) GetHPKEPrivateKey() (*hpke.PrivateKey, error) {
+	sharedKey, err := o.GetSharedKey()
+	if err != nil {
+		return nil, err
+	}
+
+	return hpke.DerivePrivateKey(sharedKey), nil
+}
+
 // GetGoogleCloudServerlessAuthenticationServiceAccount gets the GoogleCloudServerlessAuthenticationServiceAccount.
 func (o *Options) GetGoogleCloudServerlessAuthenticationServiceAccount() string {
-	if o.GoogleCloudServerlessAuthenticationServiceAccount == "" && o.Provider == "google" {
-		return o.ServiceAccount
-	}
 	return o.GoogleCloudServerlessAuthenticationServiceAccount
 }
 
 // GetSetResponseHeaders gets the SetResponseHeaders.
 func (o *Options) GetSetResponseHeaders() map[string]string {
-	if _, ok := o.SetResponseHeaders[DisableHeaderKey]; ok {
-		return map[string]string{}
-	}
-	return o.SetResponseHeaders
+	return o.GetSetResponseHeadersForPolicy(nil)
 }
 
-// GetQPS gets the QPS.
-func (o *Options) GetQPS() float64 {
-	if o.QPS < 1 {
-		return 1
+// GetSetResponseHeadersForPolicy gets the SetResponseHeaders for a policy.
+func (o *Options) GetSetResponseHeadersForPolicy(policy *Policy) map[string]string {
+	hdrs := make(map[string]string)
+	for k, v := range o.SetResponseHeaders {
+		hdrs[k] = v
 	}
-	return o.QPS
+
+	if o.SetResponseHeaders == nil {
+		for k, v := range defaultSetResponseHeaders {
+			hdrs[k] = v
+		}
+
+		if !o.HasCertificates() || o.AutocertOptions.UseStaging {
+			delete(hdrs, "Strict-Transport-Security")
+		}
+	}
+	if _, ok := hdrs[DisableHeaderKey]; ok {
+		hdrs = make(map[string]string)
+	}
+
+	if policy != nil && policy.SetResponseHeaders != nil {
+		for k, v := range policy.SetResponseHeaders {
+			hdrs[k] = v
+		}
+	}
+	if _, ok := hdrs[DisableHeaderKey]; ok {
+		hdrs = make(map[string]string)
+	}
+
+	return hdrs
 }
 
 // GetCodecType gets a codec type.
 func (o *Options) GetCodecType() CodecType {
 	if o.CodecType == CodecTypeUnset {
-		if IsAll(o.Services) {
-			return CodecTypeHTTP1
-		}
 		return CodecTypeAuto
 	}
 	return o.CodecType
 }
 
-// GetAllRouteableGRPCDomains returns all the possible gRPC domains handled by the Pomerium options.
-func (o *Options) GetAllRouteableGRPCDomains() ([]string, error) {
-	return o.GetAllRouteableGRPCDomainsForTLSServerName("")
-}
-
-// GetAllRouteableGRPCDomainsForTLSServerName  returns all the possible gRPC domains handled by the Pomerium options
-// for the given TLS server name.
-func (o *Options) GetAllRouteableGRPCDomainsForTLSServerName(tlsServerName string) ([]string, error) {
-	domains := sets.NewSortedString()
+// GetAllRouteableGRPCHosts returns all the possible gRPC hosts handled by the Pomerium options.
+func (o *Options) GetAllRouteableGRPCHosts() ([]string, error) {
+	hosts := goset.NewTreeSet(cmp.Compare[string])
 
 	// authorize urls
 	if IsAll(o.Services) {
@@ -1056,11 +1250,7 @@ func (o *Options) GetAllRouteableGRPCDomainsForTLSServerName(tlsServerName strin
 			return nil, err
 		}
 		for _, u := range authorizeURLs {
-			for _, h := range urlutil.GetDomainsForURL(*u) {
-				if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
-			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(u, true))
 		}
 	} else if IsAuthorize(o.Services) {
 		authorizeURLs, err := o.GetInternalAuthorizeURLs()
@@ -1068,11 +1258,7 @@ func (o *Options) GetAllRouteableGRPCDomainsForTLSServerName(tlsServerName strin
 			return nil, err
 		}
 		for _, u := range authorizeURLs {
-			for _, h := range urlutil.GetDomainsForURL(*u) {
-				if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
-			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(u, true))
 		}
 	}
 
@@ -1083,11 +1269,7 @@ func (o *Options) GetAllRouteableGRPCDomainsForTLSServerName(tlsServerName strin
 			return nil, err
 		}
 		for _, u := range dataBrokerURLs {
-			for _, h := range urlutil.GetDomainsForURL(*u) {
-				if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
-			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(u, true))
 		}
 	} else if IsDataBroker(o.Services) {
 		dataBrokerURLs, err := o.GetInternalDataBrokerURLs()
@@ -1095,83 +1277,175 @@ func (o *Options) GetAllRouteableGRPCDomainsForTLSServerName(tlsServerName strin
 			return nil, err
 		}
 		for _, u := range dataBrokerURLs {
-			for _, h := range urlutil.GetDomainsForURL(*u) {
-				if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
-			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(u, true))
 		}
 	}
 
-	return domains.ToSlice(), nil
+	return hosts.Slice(), nil
 }
 
-// GetAllRouteableHTTPDomains returns all the possible HTTP domains handled by the Pomerium options.
-func (o *Options) GetAllRouteableHTTPDomains() ([]string, error) {
-	return o.GetAllRouteableHTTPDomainsForTLSServerName("")
-}
-
-// GetAllRouteableHTTPDomainsForTLSServerName returns all the possible HTTP domains handled by the Pomerium options
-// for the given TLS server name.
-func (o *Options) GetAllRouteableHTTPDomainsForTLSServerName(tlsServerName string) ([]string, error) {
-	forwardAuthURL, err := o.GetForwardAuthURL()
-	if err != nil {
-		return nil, err
-	}
-
-	domains := sets.NewSortedString()
+// GetAllRouteableHTTPHosts returns all the possible HTTP hosts handled by the Pomerium options.
+func (o *Options) GetAllRouteableHTTPHosts() ([]string, error) {
+	hosts := goset.NewTreeSet(cmp.Compare[string])
 	if IsAuthenticate(o.Services) {
-		authenticateURL, err := o.GetInternalAuthenticateURL()
-		if err != nil {
-			return nil, err
-		}
-		for _, h := range urlutil.GetDomainsForURL(*authenticateURL) {
-			if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-				domains.Add(h)
+		if o.AuthenticateInternalURLString != "" {
+			authenticateURL, err := o.GetInternalAuthenticateURL()
+			if err != nil {
+				return nil, err
 			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(authenticateURL, !o.IsRuntimeFlagSet(RuntimeFlagMatchAnyIncomingPort)))
 		}
 
-		authenticateURL, err = o.GetAuthenticateURL()
-		if err != nil {
-			return nil, err
-		}
-		for _, h := range urlutil.GetDomainsForURL(*authenticateURL) {
-			if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-				domains.Add(h)
+		if o.AuthenticateURLString != "" {
+			authenticateURL, err := o.GetAuthenticateURL()
+			if err != nil {
+				return nil, err
 			}
+			hosts.InsertSlice(urlutil.GetDomainsForURL(authenticateURL, !o.IsRuntimeFlagSet(RuntimeFlagMatchAnyIncomingPort)))
 		}
 	}
 
 	// policy urls
 	if IsProxy(o.Services) {
-		for _, policy := range o.GetAllPolicies() {
-			for _, h := range urlutil.GetDomainsForURL(*policy.Source.URL) {
-				if tlsServerName == "" ||
-					policy.TLSDownstreamServerName == tlsServerName ||
-					urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
+		for policy := range o.GetAllPolicies() {
+			fromURL, err := urlutil.ParseAndValidateURL(policy.From)
+			if err != nil {
+				return nil, err
 			}
+
+			hosts.InsertSlice(urlutil.GetDomainsForURL(fromURL, !o.IsRuntimeFlagSet(RuntimeFlagMatchAnyIncomingPort)))
 			if policy.TLSDownstreamServerName != "" {
-				tlsURL := policy.Source.URL.ResolveReference(&url.URL{Host: policy.TLSDownstreamServerName})
-				for _, h := range urlutil.GetDomainsForURL(*tlsURL) {
-					if tlsServerName == "" ||
-						urlutil.StripPort(h) == tlsServerName {
-						domains.Add(h)
-					}
-				}
-			}
-		}
-		if forwardAuthURL != nil {
-			for _, h := range urlutil.GetDomainsForURL(*forwardAuthURL) {
-				if tlsServerName == "" || urlutil.StripPort(h) == tlsServerName {
-					domains.Add(h)
-				}
+				tlsURL := fromURL.ResolveReference(&url.URL{Host: policy.TLSDownstreamServerName})
+				hosts.InsertSlice(urlutil.GetDomainsForURL(tlsURL, !o.IsRuntimeFlagSet(RuntimeFlagMatchAnyIncomingPort)))
 			}
 		}
 	}
 
-	return domains.ToSlice(), nil
+	return hosts.Slice(), nil
+}
+
+// GetClientSecret gets the client secret.
+func (o *Options) GetClientSecret() (string, error) {
+	if o == nil {
+		return "", nil
+	}
+	if o.ClientSecretFile != "" {
+		bs, err := os.ReadFile(o.ClientSecretFile)
+		if err != nil {
+			return "", err
+		}
+		return string(bs), nil
+	}
+	return o.ClientSecret, nil
+}
+
+// GetCookieSecret gets the decoded cookie secret.
+func (o *Options) GetCookieSecret() ([]byte, error) {
+	cookieSecret := o.CookieSecret
+	if o.CookieSecretFile != "" {
+		bs, err := os.ReadFile(o.CookieSecretFile)
+		if err != nil {
+			return nil, err
+		}
+		cookieSecret = string(bs)
+	}
+
+	if IsAll(o.Services) && cookieSecret == "" {
+		log.WarnCookieSecret()
+		cookieSecret = randomSharedKey
+	}
+	if cookieSecret == "" {
+		return nil, errors.New("empty cookie secret")
+	}
+
+	return base64.StdEncoding.DecodeString(cookieSecret)
+}
+
+// GetCookieSameSite gets the cookie same site option.
+func (o *Options) GetCookieSameSite() http.SameSite {
+	str := strings.ToLower(o.CookieSameSite)
+	switch str {
+	case "strict":
+		return http.SameSiteStrictMode
+	case "lax":
+		return http.SameSiteLaxMode
+	case "none":
+		return http.SameSiteNoneMode
+	}
+	return http.SameSiteDefaultMode
+}
+
+// GetCSRFSameSite gets the csrf same site option.
+func (o *Options) GetCSRFSameSite() csrf.SameSiteMode {
+	if o.Provider == apple.Name {
+		// csrf.SameSiteLaxMode will cause browsers to reset
+		// the session on POST. This breaks Appleid being able
+		// to verify the csrf token.
+		return csrf.SameSiteNoneMode
+	}
+
+	str := strings.ToLower(o.CookieSameSite)
+	switch str {
+	case "strict":
+		return csrf.SameSiteStrictMode
+	case "lax":
+		return csrf.SameSiteLaxMode
+	case "none":
+		return csrf.SameSiteNoneMode
+	}
+	return csrf.SameSiteDefaultMode
+}
+
+// GetSigningKey gets the signing key.
+func (o *Options) GetSigningKey() ([]byte, error) {
+	if o == nil {
+		return nil, nil
+	}
+
+	rawSigningKey := o.SigningKey
+	if o.SigningKeyFile != "" {
+		bs, err := os.ReadFile(o.SigningKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		rawSigningKey = string(bs)
+	}
+
+	rawSigningKey = strings.TrimSpace(rawSigningKey)
+
+	if bs, err := base64.StdEncoding.DecodeString(rawSigningKey); err == nil {
+		return bs, nil
+	}
+
+	return []byte(rawSigningKey), nil
+}
+
+// GetAccessLogFields returns the access log fields. If none are set, the default fields are returned.
+func (o *Options) GetAccessLogFields() []log.AccessLogField {
+	if o.AccessLogFields == nil {
+		return log.DefaultAccessLogFields()
+	}
+	return o.AccessLogFields
+}
+
+// GetAuthorizeLogFields returns the authorize log fields. If none are set, the default fields are returned.
+func (o *Options) GetAuthorizeLogFields() []log.AuthorizeLogField {
+	if o.AuthorizeLogFields == nil {
+		return log.DefaultAuthorizeLogFields
+	}
+	return o.AuthorizeLogFields
+}
+
+// NewCookie creates a new Cookie.
+func (o *Options) NewCookie() *http.Cookie {
+	return &http.Cookie{
+		Name:     o.CookieName,
+		Domain:   o.CookieDomain,
+		Expires:  time.Now().Add(o.CookieExpire),
+		Secure:   true,
+		SameSite: o.GetCookieSameSite(),
+		HttpOnly: o.CookieHTTPOnly,
+	}
 }
 
 // Checksum returns the checksum of the current options struct
@@ -1179,307 +1453,365 @@ func (o *Options) Checksum() uint64 {
 	return hashutil.MustHash(o)
 }
 
-func (o Options) indexCerts(ctx context.Context) certsIndex {
-	idx := make(certsIndex)
-
-	if o.CertFile != "" {
-		cert, err := cryptutil.ParsePEMCertificateFromFile(o.CertFile)
-		if err != nil {
-			log.Error(ctx).Err(err).Str("file", o.CertFile).Msg("parsing local cert: skipped")
-		} else {
-			idx.addCert(cert)
-		}
-	} else if o.Cert != "" {
-		if data, err := base64.StdEncoding.DecodeString(o.Cert); err != nil {
-			log.Error(ctx).Err(err).Msg("bad base64 for local cert: skipped")
-		} else if cert, err := cryptutil.ParsePEMCertificate(data); err != nil {
-			log.Error(ctx).Err(err).Msg("parsing local cert: skipped")
-		} else {
-			idx.addCert(cert)
-		}
-	}
-
-	for _, c := range o.CertificateFiles {
-		cert, err := cryptutil.ParsePEMCertificateFromFile(c.CertFile)
-		if err != nil {
-			log.Error(ctx).Err(err).Str("file", c.CertFile).Msg("parsing local cert: skipped")
-		} else {
-			idx.addCert(cert)
-		}
-	}
-	return idx
-}
-
-func (o *Options) applyExternalCerts(ctx context.Context, certs []*config.Settings_Certificate) {
-	idx := o.indexCerts(ctx)
+func (o *Options) applyExternalCerts(ctx context.Context, certsIndex *cryptutil.CertificatesIndex, certs []*config.Settings_Certificate) {
 	for _, c := range certs {
-		cert, err := cryptutil.ParsePEMCertificate(c.CertBytes)
+		cert, err := cryptutil.ParsePEMCertificate(c.GetCertBytes())
 		if err != nil {
-			log.Error(ctx).Err(err).Msg("parsing cert from databroker: skipped")
+			log.Ctx(ctx).Error().Err(err).Msg("parsing cert from databroker: skipped")
 			continue
 		}
-		if overlaps, name := idx.matchCert(cert); overlaps {
-			log.Error(ctx).Err(err).Str("domain", name).Msg("overlaps with local certs: skipped")
+
+		if overlaps, name := certsIndex.OverlapsWithExistingCertificate(cert); overlaps {
+			log.Ctx(ctx).Error().Err(err).Str("domain", name).Msg("overlaps with local certs: skipped")
 			continue
 		}
-		cfp := certificateFilePair{
-			CertFile: c.CertFile,
-			KeyFile:  c.KeyFile,
-		}
-		if cfp.CertFile == "" {
-			cfp.CertFile = base64.StdEncoding.EncodeToString(c.CertBytes)
-		}
-		if cfp.KeyFile == "" {
-			cfp.KeyFile = base64.StdEncoding.EncodeToString(c.KeyBytes)
-		}
-		o.CertificateFiles = append(o.CertificateFiles, cfp)
+
+		o.CertificateData = append(o.CertificateData, c)
 	}
 }
 
 // ApplySettings modifies the config options using the given protobuf settings.
-func (o *Options) ApplySettings(ctx context.Context, settings *config.Settings) {
+func (o *Options) ApplySettings(ctx context.Context, certsIndex *cryptutil.CertificatesIndex, settings *config.Settings) {
 	if settings == nil {
 		return
 	}
 
-	if settings.InstallationId != nil {
-		o.InstallationID = settings.GetInstallationId()
-	}
-	if settings.Debug != nil {
-		o.Debug = settings.GetDebug()
-	}
-	if settings.LogLevel != nil {
-		o.LogLevel = settings.GetLogLevel()
-	}
-	if settings.ProxyLogLevel != nil {
-		o.ProxyLogLevel = settings.GetProxyLogLevel()
-	}
-	if settings.SharedSecret != nil {
-		o.SharedKey = settings.GetSharedSecret()
-	}
-	if settings.Services != nil {
-		o.Services = settings.GetServices()
-	}
-	if settings.Address != nil {
-		o.Addr = settings.GetAddress()
-	}
-	if settings.InsecureServer != nil {
-		o.InsecureServer = settings.GetInsecureServer()
-	}
-	if settings.DnsLookupFamily != nil {
-		o.DNSLookupFamily = settings.GetDnsLookupFamily()
-	}
-	o.applyExternalCerts(ctx, settings.GetCertificates())
-	if settings.HttpRedirectAddr != nil {
-		o.HTTPRedirectAddr = settings.GetHttpRedirectAddr()
-	}
-	if settings.TimeoutRead != nil {
-		o.ReadTimeout = settings.GetTimeoutRead().AsDuration()
-	}
-	if settings.TimeoutWrite != nil {
-		o.WriteTimeout = settings.GetTimeoutWrite().AsDuration()
-	}
-	if settings.TimeoutIdle != nil {
-		o.IdleTimeout = settings.GetTimeoutIdle().AsDuration()
-	}
-	if settings.AuthenticateServiceUrl != nil {
-		o.AuthenticateURLString = settings.GetAuthenticateServiceUrl()
-	}
-	if settings.AuthenticateInternalServiceUrl != nil {
-		o.AuthenticateInternalURLString = settings.GetAuthenticateInternalServiceUrl()
-	}
-	if settings.AuthenticateCallbackPath != nil {
-		o.AuthenticateCallbackPath = settings.GetAuthenticateCallbackPath()
-	}
-	if settings.CookieName != nil {
-		o.CookieName = settings.GetCookieName()
-	}
-	if settings.CookieSecret != nil {
-		o.CookieSecret = settings.GetCookieSecret()
-	}
-	if settings.CookieDomain != nil {
-		o.CookieDomain = settings.GetCookieDomain()
-	}
-	if settings.CookieSecure != nil {
-		o.CookieSecure = settings.GetCookieSecure()
-	}
-	if settings.CookieHttpOnly != nil {
-		o.CookieHTTPOnly = settings.GetCookieHttpOnly()
-	}
-	if settings.CookieExpire != nil {
-		o.CookieExpire = settings.GetCookieExpire().AsDuration()
-	}
-	if settings.IdpClientId != nil {
-		o.ClientID = settings.GetIdpClientId()
-	}
-	if settings.IdpClientSecret != nil {
-		o.ClientSecret = settings.GetIdpClientSecret()
-	}
-	if settings.IdpProvider != nil {
-		o.Provider = settings.GetIdpProvider()
-	}
-	if settings.IdpProviderUrl != nil {
-		o.ProviderURL = settings.GetIdpProviderUrl()
-	}
-	if len(settings.Scopes) > 0 {
-		o.Scopes = settings.Scopes
-	}
-	if settings.IdpServiceAccount != nil {
-		o.ServiceAccount = settings.GetIdpServiceAccount()
-	}
-	if settings.IdpRefreshDirectoryTimeout != nil {
-		o.RefreshDirectoryTimeout = settings.GetIdpRefreshDirectoryTimeout().AsDuration()
-	}
-	if settings.IdpRefreshDirectoryInterval != nil {
-		o.RefreshDirectoryInterval = settings.GetIdpRefreshDirectoryInterval().AsDuration()
-	}
-	if settings.RequestParams != nil && len(settings.RequestParams) > 0 {
-		o.RequestParams = settings.RequestParams
-	}
-	if len(settings.AuthorizeServiceUrls) > 0 {
-		o.AuthorizeURLStrings = settings.GetAuthorizeServiceUrls()
-	}
-	if settings.AuthorizeInternalServiceUrl != nil {
-		o.AuthorizeInternalURLString = settings.GetAuthorizeInternalServiceUrl()
-	}
-	if settings.OverrideCertificateName != nil {
-		o.OverrideCertificateName = settings.GetOverrideCertificateName()
-	}
-	if settings.CertificateAuthority != nil {
-		o.CA = settings.GetCertificateAuthority()
-	}
-	if settings.CertificateAuthorityFile != nil {
-		o.CAFile = settings.GetCertificateAuthorityFile()
-	}
-	if settings.SigningKey != nil {
-		o.SigningKey = settings.GetSigningKey()
-	}
-	if settings.SetResponseHeaders != nil && len(settings.SetResponseHeaders) > 0 {
-		o.SetResponseHeaders = settings.SetResponseHeaders
-	}
-	if len(settings.JwtClaimsHeaders) > 0 {
-		o.JWTClaimsHeaders = settings.GetJwtClaimsHeaders()
-	}
-	if settings.DefaultUpstreamTimeout != nil {
-		o.DefaultUpstreamTimeout = settings.GetDefaultUpstreamTimeout().AsDuration()
-	}
-	if settings.MetricsAddress != nil {
-		o.MetricsAddr = settings.GetMetricsAddress()
-	}
-	if settings.MetricsBasicAuth != nil {
-		o.MetricsBasicAuth = settings.GetMetricsBasicAuth()
-	}
-	if len(settings.GetMetricsCertificate().GetCertBytes()) > 0 {
-		o.MetricsCertificate = base64.StdEncoding.EncodeToString(settings.GetMetricsCertificate().GetCertBytes())
-	}
-	if len(settings.GetMetricsCertificate().GetKeyBytes()) > 0 {
-		o.MetricsCertificateKey = base64.StdEncoding.EncodeToString(settings.GetMetricsCertificate().GetKeyBytes())
-	}
-	if settings.GetMetricsCertificate().GetCertFile() != "" {
-		o.MetricsCertificateFile = settings.GetMetricsCertificate().GetCertFile()
-	}
-	if settings.GetMetricsCertificate().GetKeyFile() != "" {
-		o.MetricsCertificateKeyFile = settings.GetMetricsCertificate().GetKeyFile()
-	}
-	if settings.GetMetricsClientCa() != "" {
-		o.MetricsClientCA = settings.GetMetricsClientCa()
-	}
-	if settings.GetMetricsClientCaFile() != "" {
-		o.MetricsClientCAFile = settings.GetMetricsClientCaFile()
-	}
-	if settings.TracingProvider != nil {
-		o.TracingProvider = settings.GetTracingProvider()
-	}
-	if settings.TracingSampleRate != nil {
-		o.TracingSampleRate = settings.GetTracingSampleRate()
-	}
-	if settings.TracingJaegerCollectorEndpoint != nil {
-		o.TracingJaegerCollectorEndpoint = settings.GetTracingJaegerCollectorEndpoint()
-	}
-	if settings.TracingJaegerAgentEndpoint != nil {
-		o.TracingJaegerAgentEndpoint = settings.GetTracingJaegerAgentEndpoint()
-	}
-	if settings.TracingZipkinEndpoint != nil {
-		o.ZipkinEndpoint = settings.GetTracingZipkinEndpoint()
-	}
-	if settings.GrpcAddress != nil {
-		o.GRPCAddr = settings.GetGrpcAddress()
-	}
-	if settings.GrpcInsecure != nil {
-		o.GRPCInsecure = settings.GetGrpcInsecure()
-	}
-	if settings.ForwardAuthUrl != nil {
-		o.ForwardAuthURLString = settings.GetForwardAuthUrl()
-	}
-	if len(settings.DatabrokerServiceUrls) > 0 {
-		o.DataBrokerURLStrings = settings.GetDatabrokerServiceUrls()
-	}
-	if settings.DatabrokerInternalServiceUrl != nil {
-		o.DataBrokerInternalURLString = settings.GetDatabrokerInternalServiceUrl()
-	}
-	if settings.ClientCa != nil {
-		o.ClientCA = settings.GetClientCa()
-	}
-	if settings.ClientCaFile != nil {
-		o.ClientCAFile = settings.GetClientCaFile()
-	}
-	if settings.GoogleCloudServerlessAuthenticationServiceAccount != nil {
-		o.GoogleCloudServerlessAuthenticationServiceAccount = settings.GetGoogleCloudServerlessAuthenticationServiceAccount()
-	}
-	if settings.Autocert != nil {
-		o.AutocertOptions.Enable = settings.GetAutocert()
-	}
-	if settings.AutocertCa != nil {
-		o.AutocertOptions.CA = settings.GetAutocertCa()
-	}
-	if settings.AutocertEmail != nil {
-		o.AutocertOptions.Email = settings.GetAutocertEmail()
-	}
-	if settings.AutocertEabKeyId != nil {
-		o.AutocertOptions.EABKeyID = settings.GetAutocertEabKeyId()
-	}
-	if settings.AutocertEabMacKey != nil {
-		o.AutocertOptions.EABMACKey = settings.GetAutocertEabMacKey()
-	}
-	if settings.AutocertUseStaging != nil {
-		o.AutocertOptions.UseStaging = settings.GetAutocertUseStaging()
-	}
-	if settings.AutocertMustStaple != nil {
-		o.AutocertOptions.MustStaple = settings.GetAutocertMustStaple()
-	}
-	if settings.AutocertDir != nil {
-		o.AutocertOptions.Folder = settings.GetAutocertDir()
-	}
-	if settings.AutocertTrustedCa != nil {
-		o.AutocertOptions.TrustedCA = settings.GetAutocertTrustedCa()
-	}
-	if settings.AutocertTrustedCaFile != nil {
-		o.AutocertOptions.TrustedCAFile = settings.GetAutocertTrustedCaFile()
-	}
-	if settings.SkipXffAppend != nil {
-		o.SkipXffAppend = settings.GetSkipXffAppend()
-	}
-	if settings.XffNumTrustedHops != nil {
-		o.XffNumTrustedHops = settings.GetXffNumTrustedHops()
-	}
-	if len(settings.ProgrammaticRedirectDomainWhitelist) > 0 {
-		o.ProgrammaticRedirectDomainWhitelist = settings.GetProgrammaticRedirectDomainWhitelist()
-	}
-	if settings.AuditKey != nil {
-		o.AuditKey = &PublicKeyEncryptionKeyOptions{
-			ID:   settings.AuditKey.GetId(),
-			Data: base64.StdEncoding.EncodeToString(settings.AuditKey.GetData()),
+	set(&o.InstallationID, settings.InstallationId)
+	setLogLevel(&o.LogLevel, settings.LogLevel)
+	setAccessLogFields(&o.AccessLogFields, settings.AccessLogFields)
+	setAuthorizeLogFields(&o.AuthorizeLogFields, settings.AuthorizeLogFields)
+	setLogLevel(&o.ProxyLogLevel, settings.ProxyLogLevel)
+	set(&o.SharedKey, settings.SharedSecret)
+	set(&o.Services, settings.Services)
+	set(&o.Addr, settings.Address)
+	set(&o.InsecureServer, settings.InsecureServer)
+	set(&o.DNSLookupFamily, settings.DnsLookupFamily)
+	o.applyExternalCerts(ctx, certsIndex, settings.GetCertificates())
+	set(&o.HTTPRedirectAddr, settings.HttpRedirectAddr)
+	setDuration(&o.ReadTimeout, settings.TimeoutRead)
+	setDuration(&o.WriteTimeout, settings.TimeoutWrite)
+	setDuration(&o.IdleTimeout, settings.TimeoutIdle)
+	set(&o.AuthenticateURLString, settings.AuthenticateServiceUrl)
+	set(&o.AuthenticateInternalURLString, settings.AuthenticateInternalServiceUrl)
+	set(&o.SignOutRedirectURLString, settings.SignoutRedirectUrl)
+	set(&o.AuthenticateCallbackPath, settings.AuthenticateCallbackPath)
+	set(&o.CookieName, settings.CookieName)
+	set(&o.CookieSecret, settings.CookieSecret)
+	set(&o.CookieDomain, settings.CookieDomain)
+	set(&o.CookieHTTPOnly, settings.CookieHttpOnly)
+	setDuration(&o.CookieExpire, settings.CookieExpire)
+	set(&o.CookieSameSite, settings.CookieSameSite)
+	set(&o.ClientID, settings.IdpClientId)
+	set(&o.ClientSecret, settings.IdpClientSecret)
+	set(&o.Provider, settings.IdpProvider)
+	set(&o.ProviderURL, settings.IdpProviderUrl)
+	setSlice(&o.Scopes, settings.Scopes)
+	setMap(&o.RequestParams, settings.RequestParams)
+	setSlice(&o.AuthorizeURLStrings, settings.AuthorizeServiceUrls)
+	set(&o.AuthorizeInternalURLString, settings.AuthorizeInternalServiceUrl)
+	set(&o.OverrideCertificateName, settings.OverrideCertificateName)
+	set(&o.CA, settings.CertificateAuthority)
+	setOptional(&o.DeriveInternalDomainCert, settings.DeriveTls)
+	set(&o.SigningKey, settings.SigningKey)
+	setMap(&o.SetResponseHeaders, settings.SetResponseHeaders)
+	setMap(&o.JWTClaimsHeaders, settings.JwtClaimsHeaders)
+	if len(settings.JwtGroupsFilter) > 0 {
+		o.JWTGroupsFilter = NewJWTGroupsFilter(settings.JwtGroupsFilter)
+	}
+	setDuration(&o.DefaultUpstreamTimeout, settings.DefaultUpstreamTimeout)
+	set(&o.MetricsAddr, settings.MetricsAddress)
+	set(&o.MetricsBasicAuth, settings.MetricsBasicAuth)
+	setCertificate(&o.MetricsCertificate, &o.MetricsCertificateKey, settings.MetricsCertificate)
+	set(&o.MetricsClientCA, settings.MetricsClientCa)
+	set(&o.TracingProvider, settings.TracingProvider)
+	set(&o.TracingOTLPEndpoint, settings.TracingOtlpEndpoint)
+	set(&o.TracingOTLPProtocol, settings.TracingOtlpProtocol)
+	setOptional(&o.TracingSampleRate, settings.TracingSampleRate)
+	set(&o.TracingDatadogAddress, settings.TracingDatadogAddress)
+	set(&o.TracingJaegerCollectorEndpoint, settings.TracingJaegerCollectorEndpoint)
+	set(&o.TracingJaegerAgentEndpoint, settings.TracingJaegerAgentEndpoint)
+	set(&o.ZipkinEndpoint, settings.TracingZipkinEndpoint)
+	set(&o.GRPCAddr, settings.GrpcAddress)
+	setOptional(&o.GRPCInsecure, settings.GrpcInsecure)
+	setDuration(&o.GRPCClientTimeout, settings.GrpcClientTimeout)
+	setSlice(&o.DataBrokerURLStrings, settings.DatabrokerServiceUrls)
+	set(&o.DataBrokerInternalURLString, settings.DatabrokerInternalServiceUrl)
+	set(&o.DataBrokerStorageType, settings.DatabrokerStorageType)
+	set(&o.DataBrokerStorageConnectionString, settings.DatabrokerStorageConnectionString)
+	o.DownstreamMTLS.applySettingsProto(ctx, settings.DownstreamMtls)
+	set(&o.GoogleCloudServerlessAuthenticationServiceAccount, settings.GoogleCloudServerlessAuthenticationServiceAccount)
+	set(&o.UseProxyProtocol, settings.UseProxyProtocol)
+	set(&o.AutocertOptions.Enable, settings.Autocert)
+	set(&o.AutocertOptions.CA, settings.AutocertCa)
+	set(&o.AutocertOptions.Email, settings.AutocertEmail)
+	set(&o.AutocertOptions.EABKeyID, settings.AutocertEabKeyId)
+	set(&o.AutocertOptions.EABMACKey, settings.AutocertEabMacKey)
+	set(&o.AutocertOptions.UseStaging, settings.AutocertUseStaging)
+	set(&o.AutocertOptions.MustStaple, settings.AutocertMustStaple)
+	set(&o.AutocertOptions.Folder, settings.AutocertDir)
+	set(&o.AutocertOptions.TrustedCA, settings.AutocertTrustedCa)
+	set(&o.SkipXffAppend, settings.SkipXffAppend)
+	set(&o.XffNumTrustedHops, settings.XffNumTrustedHops)
+	set(&o.EnvoyAdminAccessLogPath, settings.EnvoyAdminAccessLogPath)
+	set(&o.EnvoyAdminProfilePath, settings.EnvoyAdminProfilePath)
+	set(&o.EnvoyAdminAddress, settings.EnvoyAdminAddress)
+	set(&o.EnvoyBindConfigSourceAddress, settings.EnvoyBindConfigSourceAddress)
+	o.EnvoyBindConfigFreebind = null.BoolFromPtr(settings.EnvoyBindConfigFreebind)
+	setSlice(&o.ProgrammaticRedirectDomainWhitelist, settings.ProgrammaticRedirectDomainWhitelist)
+	setCodecType(&o.CodecType, settings.CodecType)
+	setOptional(&o.PassIdentityHeaders, settings.PassIdentityHeaders)
+	if settings.HasBrandingOptions() {
+		o.BrandingOptions = settings
+	}
+	copyMap(&o.RuntimeFlags, settings.RuntimeFlags, func(k string, v bool) (RuntimeFlag, bool) {
+		return RuntimeFlag(k), v
+	})
+}
+
+func (o *Options) ToProto() *config.Config {
+	var settings config.Settings
+	copySrcToOptionalDest(&settings.InstallationId, &o.InstallationID)
+	copySrcToOptionalDest(&settings.LogLevel, (*string)(&o.LogLevel))
+	settings.AccessLogFields = toStringList(o.AccessLogFields)
+	settings.AuthorizeLogFields = toStringList(o.AuthorizeLogFields)
+	copySrcToOptionalDest(&settings.ProxyLogLevel, (*string)(&o.ProxyLogLevel))
+	copySrcToOptionalDest(&settings.SharedSecret, valueOrFromFileBase64(o.SharedKey, o.SharedSecretFile))
+	copySrcToOptionalDest(&settings.Services, &o.Services)
+	copySrcToOptionalDest(&settings.Address, &o.Addr)
+	copySrcToOptionalDest(&settings.InsecureServer, &o.InsecureServer)
+	copySrcToOptionalDest(&settings.DnsLookupFamily, &o.DNSLookupFamily)
+	settings.Certificates = getCertificates(o)
+	copySrcToOptionalDest(&settings.HttpRedirectAddr, &o.HTTPRedirectAddr)
+	copyOptionalDuration(&settings.TimeoutRead, o.ReadTimeout)
+	copyOptionalDuration(&settings.TimeoutWrite, o.WriteTimeout)
+	copyOptionalDuration(&settings.TimeoutIdle, o.IdleTimeout)
+	copySrcToOptionalDest(&settings.AuthenticateServiceUrl, &o.AuthenticateURLString)
+	copySrcToOptionalDest(&settings.AuthenticateInternalServiceUrl, &o.AuthenticateInternalURLString)
+	copySrcToOptionalDest(&settings.SignoutRedirectUrl, &o.SignOutRedirectURLString)
+	copySrcToOptionalDest(&settings.AuthenticateCallbackPath, &o.AuthenticateCallbackPath)
+	copySrcToOptionalDest(&settings.CookieName, &o.CookieName)
+	copySrcToOptionalDest(&settings.CookieSecret, valueOrFromFileBase64(o.CookieSecret, o.CookieSecretFile))
+	copySrcToOptionalDest(&settings.CookieDomain, &o.CookieDomain)
+	copySrcToOptionalDest(&settings.CookieHttpOnly, &o.CookieHTTPOnly)
+	copyOptionalDuration(&settings.CookieExpire, o.CookieExpire)
+	copySrcToOptionalDest(&settings.CookieSameSite, &o.CookieSameSite)
+	copySrcToOptionalDest(&settings.IdpClientId, &o.ClientID)
+	copySrcToOptionalDest(&settings.IdpClientSecret, valueOrFromFileBase64(o.ClientSecret, o.ClientSecretFile))
+	copySrcToOptionalDest(&settings.IdpProvider, &o.Provider)
+	copySrcToOptionalDest(&settings.IdpProviderUrl, &o.ProviderURL)
+	settings.Scopes = o.Scopes
+	settings.RequestParams = o.RequestParams
+	settings.AuthorizeServiceUrls = o.AuthorizeURLStrings
+	copySrcToOptionalDest(&settings.AuthorizeInternalServiceUrl, &o.AuthorizeInternalURLString)
+	copySrcToOptionalDest(&settings.OverrideCertificateName, &o.OverrideCertificateName)
+	copySrcToOptionalDest(&settings.CertificateAuthority, valueOrFromFileBase64(o.CA, o.CAFile))
+	settings.DeriveTls = o.DeriveInternalDomainCert
+	copySrcToOptionalDest(&settings.SigningKey, valueOrFromFileBase64(o.SigningKey, o.SigningKeyFile))
+	settings.SetResponseHeaders = o.SetResponseHeaders
+	settings.JwtClaimsHeaders = o.JWTClaimsHeaders
+	settings.JwtGroupsFilter = o.JWTGroupsFilter.ToSlice()
+	copyOptionalDuration(&settings.DefaultUpstreamTimeout, o.DefaultUpstreamTimeout)
+	copySrcToOptionalDest(&settings.MetricsAddress, &o.MetricsAddr)
+	copySrcToOptionalDest(&settings.MetricsBasicAuth, &o.MetricsBasicAuth)
+	settings.MetricsCertificate = toCertificateOrFromFile(o.MetricsCertificate, o.MetricsCertificateKey, o.MetricsCertificateFile, o.MetricsCertificateKeyFile)
+	copySrcToOptionalDest(&settings.MetricsClientCa, valueOrFromFileBase64(o.MetricsClientCA, o.MetricsClientCAFile))
+	copySrcToOptionalDest(&settings.TracingProvider, &o.TracingProvider)
+	settings.TracingSampleRate = o.TracingSampleRate
+	copySrcToOptionalDest(&settings.TracingOtlpEndpoint, &o.TracingOTLPEndpoint)
+	copySrcToOptionalDest(&settings.TracingOtlpProtocol, &o.TracingOTLPProtocol)
+	copySrcToOptionalDest(&settings.TracingDatadogAddress, &o.TracingDatadogAddress)
+	copySrcToOptionalDest(&settings.TracingJaegerCollectorEndpoint, &o.TracingJaegerCollectorEndpoint)
+	copySrcToOptionalDest(&settings.TracingJaegerAgentEndpoint, &o.TracingJaegerAgentEndpoint)
+	copySrcToOptionalDest(&settings.TracingZipkinEndpoint, &o.ZipkinEndpoint)
+	copySrcToOptionalDest(&settings.GrpcAddress, &o.GRPCAddr)
+	settings.GrpcInsecure = o.GRPCInsecure
+	copyOptionalDuration(&settings.GrpcClientTimeout, o.GRPCClientTimeout)
+	settings.DatabrokerServiceUrls = o.DataBrokerURLStrings
+	copySrcToOptionalDest(&settings.DatabrokerInternalServiceUrl, &o.DataBrokerInternalURLString)
+	copySrcToOptionalDest(&settings.DatabrokerStorageType, &o.DataBrokerStorageType)
+	copySrcToOptionalDest(&settings.DatabrokerStorageConnectionString, valueOrFromFileRaw(o.DataBrokerStorageConnectionString, o.DataBrokerStorageConnectionStringFile))
+	settings.DownstreamMtls = o.DownstreamMTLS.ToProto()
+	copySrcToOptionalDest(&settings.GoogleCloudServerlessAuthenticationServiceAccount, &o.GoogleCloudServerlessAuthenticationServiceAccount)
+	copySrcToOptionalDest(&settings.UseProxyProtocol, &o.UseProxyProtocol)
+	copySrcToOptionalDest(&settings.Autocert, &o.AutocertOptions.Enable)
+	copySrcToOptionalDest(&settings.AutocertCa, &o.AutocertOptions.CA)
+	copySrcToOptionalDest(&settings.AutocertEmail, &o.AutocertOptions.Email)
+	copySrcToOptionalDest(&settings.AutocertEabKeyId, &o.AutocertOptions.EABKeyID)
+	copySrcToOptionalDest(&settings.AutocertEabMacKey, &o.AutocertOptions.EABMACKey)
+	copySrcToOptionalDest(&settings.AutocertDir, &o.AutocertOptions.Folder)
+	copySrcToOptionalDest(&settings.AutocertTrustedCa, &o.AutocertOptions.TrustedCA)
+	copySrcToOptionalDest(&settings.AutocertUseStaging, &o.AutocertOptions.UseStaging)
+	copySrcToOptionalDest(&settings.AutocertMustStaple, &o.AutocertOptions.MustStaple)
+	copySrcToOptionalDest(&settings.SkipXffAppend, &o.SkipXffAppend)
+	copySrcToOptionalDest(&settings.XffNumTrustedHops, &o.XffNumTrustedHops)
+	copySrcToOptionalDest(&settings.EnvoyAdminAccessLogPath, &o.EnvoyAdminAccessLogPath)
+	copySrcToOptionalDest(&settings.EnvoyAdminProfilePath, &o.EnvoyAdminProfilePath)
+	copySrcToOptionalDest(&settings.EnvoyAdminAddress, &o.EnvoyAdminAddress)
+	copySrcToOptionalDest(&settings.EnvoyBindConfigSourceAddress, &o.EnvoyBindConfigSourceAddress)
+	settings.EnvoyBindConfigFreebind = o.EnvoyBindConfigFreebind.Ptr()
+	settings.ProgrammaticRedirectDomainWhitelist = o.ProgrammaticRedirectDomainWhitelist
+	if o.CodecType != "" {
+		codecType := o.CodecType.ToEnvoy()
+		settings.CodecType = &codecType
+	}
+	settings.PassIdentityHeaders = o.PassIdentityHeaders
+	if o.BrandingOptions != nil {
+		primaryColor := o.BrandingOptions.GetPrimaryColor()
+		secondaryColor := o.BrandingOptions.GetSecondaryColor()
+		darkmodePrimaryColor := o.BrandingOptions.GetDarkmodePrimaryColor()
+		darkmodeSecondaryColor := o.BrandingOptions.GetDarkmodeSecondaryColor()
+		logoURL := o.BrandingOptions.GetLogoUrl()
+		faviconURL := o.BrandingOptions.GetFaviconUrl()
+		errorMessageFirstParagraph := o.BrandingOptions.GetErrorMessageFirstParagraph()
+		copySrcToOptionalDest(&settings.PrimaryColor, &primaryColor)
+		copySrcToOptionalDest(&settings.SecondaryColor, &secondaryColor)
+		copySrcToOptionalDest(&settings.DarkmodePrimaryColor, &darkmodePrimaryColor)
+		copySrcToOptionalDest(&settings.DarkmodeSecondaryColor, &darkmodeSecondaryColor)
+		copySrcToOptionalDest(&settings.LogoUrl, &logoURL)
+		copySrcToOptionalDest(&settings.FaviconUrl, &faviconURL)
+		copySrcToOptionalDest(&settings.ErrorMessageFirstParagraph, &errorMessageFirstParagraph)
+	}
+	copyMap(&settings.RuntimeFlags, o.RuntimeFlags, func(k RuntimeFlag, v bool) (string, bool) {
+		return string(k), v
+	})
+
+	routes := make([]*config.Route, 0, o.NumPolicies())
+	for p := range o.GetAllPolicies() {
+		routepb, err := p.ToProto()
+		if err != nil {
+			continue
+		}
+		ppl := p.ToPPL()
+		pplIsEmpty := true
+		for _, rule := range ppl.Rules {
+			if rule.Action == parser.ActionAllow &&
+				len(rule.And) > 0 ||
+				len(rule.Nor) > 0 ||
+				len(rule.Not) > 0 ||
+				len(rule.Or) > 0 {
+				pplIsEmpty = false
+				break
+			}
+		}
+		if !pplIsEmpty {
+			raw, err := ppl.MarshalJSON()
+			if err != nil {
+				continue
+			}
+			routepb.PplPolicies = append(routepb.PplPolicies, &config.PPLPolicy{
+				Raw: raw,
+			})
+		}
+		routes = append(routes, routepb)
+	}
+	return &config.Config{
+		Settings: &settings,
+		Routes:   routes,
+	}
+}
+
+func copySrcToOptionalDest[T comparable](dst **T, src *T) {
+	var zero T
+	if *src == zero {
+		*dst = nil
+	} else {
+		if *dst == nil {
+			*dst = src
+		} else {
+			**dst = *src
 		}
 	}
-	if settings.CodecType != nil {
-		o.CodecType = CodecTypeFromEnvoy(settings.GetCodecType())
+}
+
+func toStringList[T ~string](s []T) *config.Settings_StringList {
+	if len(s) == 0 {
+		return nil
 	}
-	if settings.ClientCrl != nil {
-		o.ClientCRL = settings.GetClientCrl()
+	strings := make([]string, len(s))
+	for i, v := range s {
+		strings[i] = string(v)
 	}
-	if settings.ClientCrlFile != nil {
-		o.ClientCRLFile = settings.GetClientCrlFile()
+	return &config.Settings_StringList{Values: strings}
+}
+
+func toCertificateOrFromFile(
+	cert string, key string,
+	certFile string, keyFile string,
+) *config.Settings_Certificate {
+	var out config.Settings_Certificate
+	if cert != "" {
+		out.CertBytes, _ = base64.StdEncoding.DecodeString(cert)
+	} else if certFile != "" {
+		b, err := os.ReadFile(certFile)
+		if err == nil {
+			out.CertBytes = b
+		}
 	}
+
+	if key != "" {
+		out.KeyBytes, _ = base64.StdEncoding.DecodeString(key)
+	} else if keyFile != "" {
+		b, err := os.ReadFile(keyFile)
+		if err == nil {
+			out.KeyBytes = b
+		}
+	}
+
+	if out.CertBytes == nil && out.KeyBytes == nil {
+		return nil
+	}
+	return &out
+}
+
+func getCertificates(o *Options) []*config.Settings_Certificate {
+	certs, err := o.GetCertificates()
+	if err != nil {
+		return nil
+	}
+	out := make([]*config.Settings_Certificate, len(certs))
+	for i, crt := range certs {
+		certBytes, keyBytes, err := cryptutil.EncodeCertificate(&crt)
+		if err != nil {
+			return nil
+		}
+		out[i] = &config.Settings_Certificate{
+			CertBytes: certBytes,
+			KeyBytes:  keyBytes,
+		}
+	}
+	return out
+}
+
+func copyOptionalDuration(dst **durationpb.Duration, src time.Duration) {
+	if src == 0 {
+		*dst = nil
+	} else {
+		*dst = durationpb.New(src)
+	}
+}
+
+func valueOrFromFileRaw(value string, valueFile string) *string {
+	if value != "" {
+		return &value
+	}
+	if valueFile == "" {
+		return &valueFile
+	}
+	data, _ := os.ReadFile(valueFile)
+	dataStr := string(data)
+	return &dataStr
+}
+
+func valueOrFromFileBase64(value string, valueFile string) *string {
+	if value != "" {
+		return &value
+	}
+	if valueFile == "" {
+		return &valueFile
+	}
+	data, _ := os.ReadFile(valueFile)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return &encoded
 }
 
 func dataDir() string {
@@ -1522,24 +1854,108 @@ func min(x, y int) int {
 	return y
 }
 
-// AtomicOptions are Options that can be access atomically.
-type AtomicOptions struct {
-	value atomic.Value
-}
-
 // NewAtomicOptions creates a new AtomicOptions.
-func NewAtomicOptions() *AtomicOptions {
-	ao := new(AtomicOptions)
-	ao.Store(new(Options))
-	return ao
+func NewAtomicOptions() *atomicutil.Value[*Options] {
+	return atomicutil.NewValue(new(Options))
 }
 
-// Load loads the options.
-func (a *AtomicOptions) Load() *Options {
-	return a.value.Load().(*Options)
+func set[T any](dst, src *T) {
+	if src == nil {
+		return
+	}
+	*dst = *src
 }
 
-// Store stores the options.
-func (a *AtomicOptions) Store(options *Options) {
-	a.value.Store(options)
+func setAccessLogFields(dst *[]log.AccessLogField, src *config.Settings_StringList) {
+	if src == nil {
+		return
+	}
+	*dst = make([]log.AccessLogField, len(src.Values))
+	for i, v := range src.Values {
+		(*dst)[i] = log.AccessLogField(v)
+	}
+}
+
+func setAuthorizeLogFields(dst *[]log.AuthorizeLogField, src *config.Settings_StringList) {
+	if src == nil {
+		return
+	}
+	*dst = make([]log.AuthorizeLogField, len(src.Values))
+	for i, v := range src.Values {
+		(*dst)[i] = log.AuthorizeLogField(v)
+	}
+}
+
+func setCodecType(dst *CodecType, src *envoy_http_connection_manager.HttpConnectionManager_CodecType) {
+	if src == nil {
+		return
+	}
+	*dst = CodecTypeFromEnvoy(*src)
+}
+
+func setDuration(dst *time.Duration, src *durationpb.Duration) {
+	if src == nil {
+		return
+	}
+	*dst = src.AsDuration()
+}
+
+func setLogLevel(dst *LogLevel, src *string) {
+	if src == nil {
+		return
+	}
+	*dst = LogLevel(*src)
+}
+
+func setOptional[T any](dst **T, src *T) {
+	if src == nil {
+		return
+	}
+	v := *src
+	*dst = &v
+}
+
+func setSlice[T any](dst *[]T, src []T) {
+	if len(src) == 0 {
+		return
+	}
+	*dst = src
+}
+
+func setMap[TKey comparable, TValue any, TMap ~map[TKey]TValue](dst *TMap, src map[TKey]TValue) {
+	if len(src) == 0 {
+		return
+	}
+	*dst = src
+}
+
+func copyMap[T1Key comparable, T1Value any, T2Key comparable, T2Value any, TMap1 ~map[T1Key]T1Value, TMap2 ~map[T2Key]T2Value](
+	dst *TMap1,
+	src TMap2,
+	convert func(T2Key, T2Value) (T1Key, T1Value),
+) {
+	if len(src) == 0 {
+		return
+	}
+	*dst = make(TMap1, len(src))
+	for k, v := range src {
+		k1, v1 := convert(k, v)
+		(*dst)[k1] = v1
+	}
+}
+
+func setCertificate(
+	dstCertificate *string,
+	dstCertificateKey *string,
+	src *config.Settings_Certificate,
+) {
+	if src == nil {
+		return
+	}
+	if len(src.GetCertBytes()) > 0 {
+		*dstCertificate = base64.StdEncoding.EncodeToString(src.GetCertBytes())
+	}
+	if len(src.GetKeyBytes()) > 0 {
+		*dstCertificateKey = base64.StdEncoding.EncodeToString(src.GetKeyBytes())
+	}
 }

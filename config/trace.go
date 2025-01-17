@@ -6,12 +6,12 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/rs/zerolog"
+
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/telemetry"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
 	"github.com/pomerium/pomerium/internal/urlutil"
-
-	"github.com/rs/zerolog"
 )
 
 // TracingOptions are the options for tracing.
@@ -19,11 +19,15 @@ type TracingOptions = trace.TracingOptions
 
 // NewTracingOptions builds a new TracingOptions from core Options
 func NewTracingOptions(o *Options) (*TracingOptions, error) {
+	sampleRate := 1.0
+	if o.TracingSampleRate != nil {
+		sampleRate = *o.TracingSampleRate
+	}
 	tracingOpts := TracingOptions{
 		Provider:            o.TracingProvider,
 		Service:             telemetry.ServiceName(o.Services),
 		JaegerAgentEndpoint: o.TracingJaegerAgentEndpoint,
-		SampleRate:          o.TracingSampleRate,
+		SampleRate:          sampleRate,
 	}
 
 	switch o.TracingProvider {
@@ -90,12 +94,12 @@ func (mgr *TraceManager) OnConfigChange(ctx context.Context, cfg *Config) {
 
 	traceOpts, err := NewTracingOptions(cfg.Options)
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("trace: failed to build tracing options")
+		log.Ctx(ctx).Error().Err(err).Msg("trace: failed to build tracing options")
 		return
 	}
 
 	if reflect.DeepEqual(traceOpts, mgr.traceOpts) {
-		log.Debug(ctx).Msg("no change detected in trace options")
+		log.Ctx(ctx).Debug().Msg("no change detected in trace options")
 		return
 	}
 	mgr.traceOpts = traceOpts
@@ -109,17 +113,17 @@ func (mgr *TraceManager) OnConfigChange(ctx context.Context, cfg *Config) {
 		return
 	}
 
-	log.Info(ctx).Interface("options", traceOpts).Msg("trace: starting exporter")
+	log.Ctx(ctx).Info().Interface("options", traceOpts).Msg("trace: starting exporter")
 
 	mgr.provider, err = trace.GetProvider(traceOpts)
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("trace: failed to register exporter")
+		log.Ctx(ctx).Error().Err(err).Msg("trace: failed to register exporter")
 		return
 	}
 
 	err = mgr.provider.Register(traceOpts)
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("trace: failed to register exporter")
+		log.Ctx(ctx).Error().Err(err).Msg("trace: failed to register exporter")
 		return
 	}
 }

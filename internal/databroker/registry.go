@@ -3,14 +3,15 @@ package databroker
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/registry"
 	"github.com/pomerium/pomerium/internal/registry/inmemory"
-	"github.com/pomerium/pomerium/internal/registry/redis"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
 	registrypb "github.com/pomerium/pomerium/pkg/grpc/registry"
+	"github.com/pomerium/pomerium/pkg/storage"
 )
 
 type registryWatchServer struct {
@@ -27,7 +28,7 @@ func (srv *Server) Report(ctx context.Context, req *registrypb.RegisterRequest) 
 	ctx, span := trace.StartSpan(ctx, "databroker.grpc.Report")
 	defer span.End()
 
-	r, err := srv.getRegistry()
+	r, err := srv.getRegistry(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +41,7 @@ func (srv *Server) List(ctx context.Context, req *registrypb.ListRequest) (*regi
 	ctx, span := trace.StartSpan(ctx, "databroker.grpc.List")
 	defer span.End()
 
-	r, err := srv.getRegistry()
+	r, err := srv.getRegistry(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +55,7 @@ func (srv *Server) Watch(req *registrypb.ListRequest, stream registrypb.Registry
 	ctx, span := trace.StartSpan(ctx, "databroker.grpc.Watch")
 	defer span.End()
 
-	r, err := srv.getRegistry()
+	r, err := srv.getRegistry(ctx)
 	if err != nil {
 		return err
 	}
@@ -65,7 +66,12 @@ func (srv *Server) Watch(req *registrypb.ListRequest, stream registrypb.Registry
 	})
 }
 
-func (srv *Server) getRegistry() (registry.Interface, error) {
+func (srv *Server) getRegistry(ctx context.Context) (registry.Interface, error) {
+	backend, err := srv.getBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// double-checked locking
 	srv.mu.RLock()
 	r := srv.registry
@@ -75,7 +81,7 @@ func (srv *Server) getRegistry() (registry.Interface, error) {
 		r = srv.registry
 		var err error
 		if r == nil {
-			r, err = srv.newRegistryLocked()
+			r, err = srv.newRegistryLocked(ctx, backend)
 			srv.registry = r
 		}
 		srv.mu.Unlock()
@@ -86,23 +92,21 @@ func (srv *Server) getRegistry() (registry.Interface, error) {
 	return r, nil
 }
 
-func (srv *Server) newRegistryLocked() (registry.Interface, error) {
-	ctx := context.Background()
+func (srv *Server) newRegistryLocked(ctx context.Context, backend storage.Backend) (registry.Interface, error) {
+	if hasRegistryServer, ok := backend.(interface {
+		RegistryServer() registrypb.RegistryServer
+	}); ok {
+		log.Ctx(ctx).Info().Msg("using registry via storage")
+		return struct {
+			io.Closer
+			registrypb.RegistryServer
+		}{backend, hasRegistryServer.RegistryServer()}, nil
+	}
 
 	switch srv.cfg.storageType {
 	case config.StorageInMemoryName:
-		log.Info(ctx).Msg("using in-memory registry")
+		log.Ctx(ctx).Info().Msg("using in-memory registry")
 		return inmemory.New(ctx, srv.cfg.registryTTL), nil
-	case config.StorageRedisName:
-		log.Info(ctx).Msg("using redis registry")
-		r, err := redis.New(
-			srv.cfg.storageConnectionString,
-			redis.WithTLSConfig(srv.getTLSConfigLocked(ctx)),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create new redis registry: %w", err)
-		}
-		return r, nil
 	}
 
 	return nil, fmt.Errorf("unsupported registry type: %s", srv.cfg.storageType)

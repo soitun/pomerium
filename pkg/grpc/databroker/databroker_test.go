@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/pomerium/pomerium/internal/testutil"
 	"github.com/pomerium/pomerium/pkg/protoutil"
 )
 
@@ -69,7 +70,7 @@ func TestInitialSync(t *testing.T) {
 	r2 := new(Record)
 
 	m := &mockServer{
-		syncLatest: func(req *SyncLatestRequest, stream DataBrokerService_SyncLatestServer) error {
+		syncLatest: func(_ *SyncLatestRequest, stream DataBrokerService_SyncLatestServer) error {
 			stream.Send(&SyncLatestResponse{
 				Response: &SyncLatestResponse_Record{
 					Record: r1,
@@ -108,7 +109,7 @@ func TestInitialSync(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(2), recordVersion)
 	assert.Equal(t, uint64(1), serverVersion)
-	assert.Equal(t, []*Record{r1, r2}, records)
+	testutil.AssertProtoEqual(t, []*Record{r1, r2}, records)
 }
 
 func TestOptimumPutRequestsFromRecords(t *testing.T) {

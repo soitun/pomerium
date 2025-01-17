@@ -6,14 +6,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pomerium/pomerium/internal/registry"
-	"github.com/pomerium/pomerium/internal/signal"
-	pb "github.com/pomerium/pomerium/pkg/grpc/registry"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/pomerium/pomerium/internal/registry"
+	"github.com/pomerium/pomerium/internal/signal"
+	pb "github.com/pomerium/pomerium/pkg/grpc/registry"
 )
 
 type inMemoryServer struct {
@@ -33,7 +33,7 @@ type inMemoryKey struct {
 }
 
 // New constructs a new registry tracking service that operates in RAM
-// as such, it is not usable for multi-node deployment where REDIS or other alternative should be used
+// as such, it is not usable for multi-node deployment.
 func New(ctx context.Context, ttl time.Duration) registry.Interface {
 	srv := &inMemoryServer{
 		ttl:      ttl,
@@ -131,7 +131,7 @@ func (s *inMemoryServer) reportLocked(services []*pb.Service) (bool, error) {
 }
 
 // List returns current snapshot of the services known to the registry
-func (s *inMemoryServer) List(ctx context.Context, req *pb.ListRequest) (*pb.ServiceList, error) {
+func (s *inMemoryServer) List(_ context.Context, req *pb.ListRequest) (*pb.ServiceList, error) {
 	if err := req.Validate(); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

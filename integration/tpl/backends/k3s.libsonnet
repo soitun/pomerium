@@ -7,7 +7,7 @@ local Command() =
     |||
       set -x
       # the dev image is only available locally, so load it first
-      if [ "${POMERIUM_TAG:-master}" = "dev" ]; then
+      if [ "${POMERIUM_TAG:-main}" = "dev" ]; then
         sh -c '
           while true ; do
             ctr --connect-timeout=1s --timeout=60s images import /k3s-tmp/pomerium-dev.tar && break
@@ -15,7 +15,7 @@ local Command() =
           done
         ' &
       fi
-      k3s "$$@"
+      exec k3s "$$@"
     |||,
     'k3s',
   ];
@@ -30,11 +30,13 @@ local InstallManifest(manifest) =
     'kubectl wait --for=condition=available deployment/' + manifest.metadata.name,
   ] else []);
 
+local k3s_tag = 'v1.30.0-k3s1';
+
 function(idp, manifests) {
   compose: {
     services:
       utils.ComposeService('k3s-server', {
-        image: 'rancher/k3s:${K3S_TAG:-latest}',
+        image: 'rancher/k3s:${K3S_TAG:-' + k3s_tag + '}',
         entrypoint: Command() + [
           'server',
           '--disable',
@@ -73,7 +75,7 @@ function(idp, manifests) {
         ],
       }) +
       utils.ComposeService('k3s-agent', {
-        image: 'rancher/k3s:${K3S_TAG:-latest}',
+        image: 'rancher/k3s:${K3S_TAG:-' + k3s_tag + '}',
         entrypoint: Command() + ['agent'],
         tmpfs: ['/run', '/var/run'],
         ulimits: {
@@ -94,7 +96,7 @@ function(idp, manifests) {
         ],
       }) +
       utils.ComposeService('k3s-init', {
-        image: 'rancher/k3s:${K3S_TAG:-latest}',
+        image: 'rancher/k3s:${K3S_TAG:-' + k3s_tag + '}',
         depends_on: {
           'k3s-server': {
             condition: 'service_healthy',

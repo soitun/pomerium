@@ -63,8 +63,8 @@ func NewGRPCClientConn(ctx context.Context, opts *Options, other ...grpc.DialOpt
 	}
 	streamClientInterceptors := []grpc.StreamClientInterceptor{}
 	if opts.SignedJWTKey != nil {
-		unaryClientInterceptors = append(unaryClientInterceptors, WithUnarySignedJWT(opts.SignedJWTKey))
-		streamClientInterceptors = append(streamClientInterceptors, WithStreamSignedJWT(opts.SignedJWTKey))
+		unaryClientInterceptors = append(unaryClientInterceptors, WithUnarySignedJWT(func() []byte { return opts.SignedJWTKey }))
+		streamClientInterceptors = append(streamClientInterceptors, WithStreamSignedJWT(func() []byte { return opts.SignedJWTKey }))
 	}
 
 	dialOptions := []grpc.DialOption{
@@ -85,7 +85,7 @@ func NewGRPCClientConn(ctx context.Context, opts *Options, other ...grpc.DialOpt
 		}
 
 		cert := credentials.NewTLS(&tls.Config{
-			// nolint: gosec
+			//nolint: gosec
 			InsecureSkipVerify: opts.InsecureSkipVerify,
 			RootCAs:            rootCAs,
 			MinVersion:         tls.VersionTLS12,
@@ -107,7 +107,7 @@ func NewGRPCClientConn(ctx context.Context, opts *Options, other ...grpc.DialOpt
 
 // grpcTimeoutInterceptor enforces per-RPC request timeouts
 func grpcTimeoutInterceptor(timeout time.Duration) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		if timeout <= 0 {
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}

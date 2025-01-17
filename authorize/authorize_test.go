@@ -7,7 +7,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pomerium/pomerium/authorize/evaluator"
+	"github.com/pomerium/pomerium/authorize/internal/store"
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/pkg/policy/criteria"
 )
 
 func TestNew(t *testing.T) {
@@ -23,6 +26,7 @@ func TestNew(t *testing.T) {
 			config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "https://databroker.example.com",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             "2p/Wi2Q6bYDfzmoSEbKqYKtg+DUoLWTEHHs7vOhvL7w=",
 				Policies:              policies,
 			},
@@ -33,6 +37,7 @@ func TestNew(t *testing.T) {
 			config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "https://databroker.example.com",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             "AZA85podM73CjLCjViDNz1EUvvejKpWp7Hysr0knXA==",
 				Policies:              policies,
 			},
@@ -43,6 +48,7 @@ func TestNew(t *testing.T) {
 			config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "https://databroker.example.com",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             "sup",
 				Policies:              policies,
 			},
@@ -53,6 +59,7 @@ func TestNew(t *testing.T) {
 			config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "https://databroker.example.com",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             "AZA85podM73CjLCjViDNz1EUvvejKpWp7Hysr0knXA==",
 				Policies:              policies,
 			},
@@ -64,6 +71,7 @@ func TestNew(t *testing.T) {
 			config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "BAD",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             "AZA85podM73CjLCjViDNz1EUvvejKpWp7Hysr0knXA==",
 				Policies:              policies,
 			},
@@ -74,7 +82,7 @@ func TestNew(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := New(&config.Config{Options: &tt.config})
+			_, err := New(context.Background(), &config.Config{Options: &tt.config})
 			if (err != nil) != tt.wantErr {
 				t.Errorf("New() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -102,10 +110,11 @@ func TestAuthorize_OnConfigChange(t *testing.T) {
 			o := &config.Options{
 				AuthenticateURLString: "https://authN.example.com",
 				DataBrokerURLString:   "https://databroker.example.com",
+				CookieSecret:          "15WXae6fvK9Hal0RGZ600JlCaflYHtNy9bAyOLTlvmc=",
 				SharedKey:             tc.SharedKey,
 				Policies:              tc.Policies,
 			}
-			a, err := New(&config.Config{Options: o})
+			a, err := New(context.Background(), &config.Config{Options: o})
 			require.NoError(t, err)
 			require.NotNil(t, a)
 
@@ -137,4 +146,54 @@ func testPolicies(t *testing.T) []config.Policy {
 		testPolicy,
 	}
 	return policies
+}
+
+func TestNewPolicyEvaluator_addDefaultClientCertificateRule(t *testing.T) {
+	t.Parallel()
+
+	resultFalse := evaluator.NewRuleResult(false) // no mention of client certificates
+	resultClientCertificateRequired := evaluator.NewRuleResult(true,
+		criteria.ReasonClientCertificateRequired)
+
+	cases := []struct {
+		label    string
+		opts     *config.Options
+		expected evaluator.RuleResult
+	}{
+		{"zero", &config.Options{}, resultFalse},
+		{"default", config.NewDefaultOptions(), resultFalse},
+		{"client CA, default enforcement", &config.Options{
+			DownstreamMTLS: config.DownstreamMTLSSettings{CA: "ZmFrZSBDQQ=="},
+		}, resultClientCertificateRequired},
+		{"client CA, reject connection", &config.Options{
+			DownstreamMTLS: config.DownstreamMTLSSettings{
+				CA:          "ZmFrZSBDQQ==",
+				Enforcement: config.MTLSEnforcementRejectConnection,
+			},
+		}, resultClientCertificateRequired},
+		{"client CA, policy", &config.Options{
+			DownstreamMTLS: config.DownstreamMTLSSettings{
+				CA:          "ZmFrZSBDQQ==",
+				Enforcement: config.MTLSEnforcementPolicy,
+			},
+		}, resultFalse},
+	}
+	for i := range cases {
+		c := &cases[i]
+		t.Run(c.label, func(t *testing.T) {
+			store := store.New()
+			c.opts.Policies = []config.Policy{{
+				To: mustParseWeightedURLs(t, "http://example.com"),
+			}}
+			e, err := newPolicyEvaluator(context.Background(), c.opts, store, nil)
+			require.NoError(t, err)
+
+			r, err := e.Evaluate(context.Background(), &evaluator.Request{
+				Policy: &c.opts.Policies[0],
+				HTTP:   evaluator.RequestHTTP{},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, c.expected, r.Deny)
+		})
+	}
 }

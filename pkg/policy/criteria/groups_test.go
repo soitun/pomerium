@@ -5,7 +5,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/pomerium/pomerium/pkg/grpc/directory"
+	"github.com/pomerium/datasource/pkg/directory"
+	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/grpc/session"
 )
 
@@ -18,7 +19,7 @@ allow:
         has: group1
     - groups:
         has: group2
-`, []dataBrokerRecord{}, Input{Session: InputSession{ID: "SESSION_ID"}})
+`, []*databroker.Record{}, Input{Session: InputSession{ID: "session1"}})
 		require.NoError(t, err)
 		require.Equal(t, A{false, A{ReasonUserUnauthenticated}, M{}}, res["allow"])
 		require.Equal(t, A{false, A{}}, res["deny"])
@@ -30,71 +31,39 @@ allow:
     - groups:
         has: group1
 `,
-			[]dataBrokerRecord{
-				&session.Session{
-					Id:     "SESSION_ID",
-					UserId: "USER_ID",
-				},
-				&directory.User{
-					Id:       "USER_ID",
-					GroupIds: []string{"group1"},
-				},
+			[]*databroker.Record{
+				makeRecord(&session.Session{
+					Id:     "session1",
+					UserId: "user1",
+				}),
+				makeStructRecord(directory.UserRecordType, "user1", map[string]any{
+					"group_ids": []any{"group1", "group2"},
+				}),
 			},
-			Input{Session: InputSession{ID: "SESSION_ID"}})
+			Input{Session: InputSession{ID: "session1"}})
 		require.NoError(t, err)
 		require.Equal(t, A{true, A{ReasonGroupsOK}, M{}}, res["allow"])
 		require.Equal(t, A{false, A{}}, res["deny"])
 	})
-	t.Run("by email", func(t *testing.T) {
+	t.Run("not allowed", func(t *testing.T) {
 		res, err := evaluate(t, `
 allow:
   and:
     - groups:
-        has: "group1@example.com"
+        has: group1
 `,
-			[]dataBrokerRecord{
-				&session.Session{
-					Id:     "SESSION_ID",
-					UserId: "USER_ID",
-				},
-				&directory.User{
-					Id:       "USER_ID",
-					GroupIds: []string{"group1"},
-				},
-				&directory.Group{
-					Id:    "group1",
-					Email: "group1@example.com",
-				},
+			[]*databroker.Record{
+				makeRecord(&session.Session{
+					Id:     "session1",
+					UserId: "user1",
+				}),
+				makeStructRecord(directory.UserRecordType, "user1", map[string]any{
+					"group_ids": []any{"group2"},
+				}),
 			},
-			Input{Session: InputSession{ID: "SESSION_ID"}})
+			Input{Session: InputSession{ID: "session1"}})
 		require.NoError(t, err)
-		require.Equal(t, A{true, A{ReasonGroupsOK}, M{}}, res["allow"])
-		require.Equal(t, A{false, A{}}, res["deny"])
-	})
-	t.Run("by name", func(t *testing.T) {
-		res, err := evaluate(t, `
-allow:
-  and:
-    - groups:
-        has: "Group 1"
-`,
-			[]dataBrokerRecord{
-				&session.Session{
-					Id:     "SESSION_ID",
-					UserId: "USER_ID",
-				},
-				&directory.User{
-					Id:       "USER_ID",
-					GroupIds: []string{"group1"},
-				},
-				&directory.Group{
-					Id:   "group1",
-					Name: "Group 1",
-				},
-			},
-			Input{Session: InputSession{ID: "SESSION_ID"}})
-		require.NoError(t, err)
-		require.Equal(t, A{true, A{ReasonGroupsOK}, M{}}, res["allow"])
+		require.Equal(t, A{false, A{ReasonGroupsUnauthorized}, M{}}, res["allow"])
 		require.Equal(t, A{false, A{}}, res["deny"])
 	})
 }

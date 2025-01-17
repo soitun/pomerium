@@ -22,16 +22,16 @@ const maxEvents = 50
 var outboundGRPCConnection = new(grpc.CachedOutboundGRPClientConn)
 
 func (srv *Server) storeEvent(ctx context.Context, evt proto.Message) error {
-	any := protoutil.NewAny(evt)
+	data := protoutil.NewAny(evt)
 
 	client, err := srv.getDataBrokerClient(ctx)
 	if err != nil {
 		return err
 	}
 
-	if !srv.haveSetCapacity[any.GetTypeUrl()] {
+	if !srv.haveSetCapacity[data.GetTypeUrl()] {
 		_, err = client.SetOptions(ctx, &databrokerpb.SetOptionsRequest{
-			Type: any.GetTypeUrl(),
+			Type: data.GetTypeUrl(),
 			Options: &databrokerpb.Options{
 				Capacity: proto.Uint64(maxEvents),
 			},
@@ -39,7 +39,7 @@ func (srv *Server) storeEvent(ctx context.Context, evt proto.Message) error {
 		if err != nil {
 			return err
 		}
-		srv.haveSetCapacity[any.GetTypeUrl()] = true
+		srv.haveSetCapacity[data.GetTypeUrl()] = true
 	}
 
 	var id string
@@ -51,9 +51,9 @@ func (srv *Server) storeEvent(ctx context.Context, evt proto.Message) error {
 
 	_, err = client.Put(ctx, &databrokerpb.PutRequest{
 		Records: []*databrokerpb.Record{{
-			Type: any.GetTypeUrl(),
+			Type: data.GetTypeUrl(),
 			Id:   id,
-			Data: any,
+			Data: data,
 		}},
 	})
 	if err != nil {
@@ -71,7 +71,7 @@ func (srv *Server) getDataBrokerClient(ctx context.Context) (databrokerpb.DataBr
 		return nil, err
 	}
 
-	cc, err := outboundGRPCConnection.Get(context.Background(), &grpc.OutboundOptions{
+	cc, err := outboundGRPCConnection.Get(ctx, &grpc.OutboundOptions{
 		OutboundPort:   cfg.OutboundPort,
 		InstallationID: cfg.Options.InstallationID,
 		ServiceName:    cfg.Options.Services,
@@ -80,7 +80,6 @@ func (srv *Server) getDataBrokerClient(ctx context.Context) (databrokerpb.DataBr
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: error creating databroker connection: %w", err)
 	}
-	_ = grpc.WaitForReady(ctx, cc, time.Second*10)
 	client := databrokerpb.NewDataBrokerServiceClient(cc)
 	return client, nil
 }
@@ -98,10 +97,10 @@ func withGRPCBackoff(ctx context.Context, f func() error) {
 		case status.Code(err) == codes.Unavailable,
 			status.Code(err) == codes.ResourceExhausted,
 			status.Code(err) == codes.DeadlineExceeded:
-			log.Error(ctx).Err(err).Msg("controlplane: error storing configuration event, retrying")
+			log.Ctx(ctx).Error().Err(err).Msg("controlplane: error storing configuration event, retrying")
 			// retry
 		default:
-			log.Error(ctx).Err(err).Msg("controlplane: error storing configuration event")
+			log.Ctx(ctx).Error().Err(err).Msg("controlplane: error storing configuration event")
 			return
 		}
 

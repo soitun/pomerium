@@ -1,6 +1,7 @@
-import IDField from "./IDField";
-import { DateTime } from "luxon";
+import isArray from "lodash/isArray";
 import React, { FC } from "react";
+
+import IDField from "./IDField";
 
 const unixSecondTimestampFields = new Set(["exp", "iat", "nbf", "auth_time"]);
 
@@ -11,8 +12,21 @@ type ClaimValueProps = {
   claimValue: unknown;
 };
 const ClaimValue: FC<ClaimValueProps> = ({ claimKey, claimValue }) => {
+  if (isArray(claimValue)) {
+    return (
+      <>
+        {claimValue?.map((v, i) => (
+          <React.Fragment key={`${v}`}>
+            {i > 0 ? <br /> : <></>}
+            <ClaimValue claimKey={claimKey} claimValue={v} />
+          </React.Fragment>
+        ))}
+      </>
+    );
+  }
+
   if (unixSecondTimestampFields.has(claimKey)) {
-    return <>{DateTime.fromMillis((claimValue as number) * 1000).toISO()}</>;
+    return <>{new Date((claimValue as number) * 1000).toISOString()}</>;
   }
 
   if (idFields.has(claimKey)) {

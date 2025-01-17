@@ -1,4 +1,4 @@
-FROM node:16@sha256:68e34cfcd8276ad531b12b3454af5c24cd028752dfccacce4e19efef6f7cdbe0 as ui
+FROM node:lts-bookworm@sha256:0e910f435308c36ea60b4cfd7b80208044d77a074d16b768a81901ce938a62dc AS ui
 WORKDIR /build
 
 COPY .git ./.git
@@ -13,13 +13,13 @@ RUN make yarn
 COPY ./ui/ ./ui/
 RUN make build-ui
 
-FROM golang:1.17-buster@sha256:e9f0ce41eac62541ecbd9b7115916617c96a070fe0cca8e494eff829b234b31b as build
+FROM golang:1.23-bookworm@sha256:2e838582004fab0931693a3a84743ceccfbfeeafa8187e87291a1afea457ff7a AS build
 WORKDIR /go/src/github.com/pomerium/pomerium
 
 RUN apt-get update \
     && apt-get -y --no-install-recommends install zip
 
-# cache depedency downloads
+# cache dependency downloads
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
@@ -30,10 +30,9 @@ RUN make build-debug NAME=pomerium
 RUN touch /config.yaml
 RUN go install github.com/go-delve/delve/cmd/dlv@latest
 
-FROM alpine:latest@sha256:6af1b11bbb17f4c311e269db6530e4da2738262af5fd9064ccdf109b765860fb
-ENV AUTOCERT_DIR /data/autocert
+FROM debian:bookworm@sha256:b16cef8cbcb20935c0f052e37fc3d38dc92bfec0bcfb894c328547f81e932d67
+ENV AUTOCERT_DIR=/data/autocert
 WORKDIR /pomerium
-RUN apk add --no-cache ca-certificates libc6-compat gcompat
 COPY --from=build /go/src/github.com/pomerium/pomerium/bin/* /bin/
 COPY --from=build /config.yaml /pomerium/config.yaml
 COPY --from=build /go/bin/dlv /bin

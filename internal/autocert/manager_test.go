@@ -28,7 +28,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
-	"github.com/mholt/acmez/acme"
+	"github.com/mholt/acmez/v2/acme"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ocsp"
@@ -37,7 +37,7 @@ import (
 	"github.com/pomerium/pomerium/internal/log"
 )
 
-type M = map[string]interface{}
+type M = map[string]any
 
 type testCA struct {
 	key     *ecdsa.PrivateKey
@@ -94,7 +94,7 @@ func newMockACME(ca *testCA, srv *httptest.Server) http.Handler {
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
-	r.Get("/acme/directory", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/acme/directory", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(M{
 			"keyChange":  srv.URL + "/acme/key-change",
@@ -104,11 +104,11 @@ func newMockACME(ca *testCA, srv *httptest.Server) http.Handler {
 			"revokeCert": srv.URL + "/acme/revoke-cert",
 		})
 	})
-	r.Head("/acme/new-nonce", func(w http.ResponseWriter, r *http.Request) {
+	r.Head("/acme/new-nonce", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Replay-Nonce", "NONCE")
 		w.WriteHeader(http.StatusOK)
 	})
-	r.Post("/acme/new-acct", func(w http.ResponseWriter, r *http.Request) {
+	r.Post("/acme/new-acct", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Replay-Nonce", "NONCE")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -188,13 +188,13 @@ func newMockACME(ca *testCA, srv *httptest.Server) http.Handler {
 			"certificate": srv.URL + "/acme/certificate",
 		})
 	})
-	r.Post("/acme/certificate", func(w http.ResponseWriter, r *http.Request) {
+	r.Post("/acme/certificate", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Replay-Nonce", "NONCE")
 		w.Header().Set("Content-Type", "application/pem-certificate-chain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(certBuffer.Bytes())
 	})
-	r.Get("/certs/ca", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/certs/ca", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/pkix-cert")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(ca.cert.Raw)
@@ -217,14 +217,13 @@ func TestConfig(t *testing.T) {
 
 	mockACME = newMockACME(ca, srv)
 
+	// avoid using t.TempDir so tests don't fail: https://github.com/pomerium/pomerium/issues/4757
 	tmpdir := filepath.Join(os.TempDir(), uuid.New().String())
 	_ = os.MkdirAll(tmpdir, 0o755)
 	defer os.RemoveAll(tmpdir)
 
 	li, err := net.Listen("tcp", "127.0.0.1:0")
-	if !assert.NoError(t, err) {
-		return
-	}
+	require.NoError(t, err)
 	addr := li.Addr().String()
 	_ = li.Close()
 
@@ -262,13 +261,16 @@ func TestConfig(t *testing.T) {
 	var initialOCSPStaple []byte
 	var certValidTime *time.Time
 	mgr.OnConfigChange(ctx, func(ctx context.Context, cfg *config.Config) {
-		log.Info(ctx).Msg("OnConfigChange")
+		if len(cfg.AutoCertificates) == 0 {
+			return
+		}
+
 		cert := cfg.AutoCertificates[0]
 		if initialOCSPStaple == nil {
 			initialOCSPStaple = cert.OCSPStaple
 		} else {
-			if bytes.Compare(initialOCSPStaple, cert.OCSPStaple) != 0 {
-				log.Info(ctx).Msg("OCSP updated")
+			if !bytes.Equal(initialOCSPStaple, cert.OCSPStaple) {
+				log.Ctx(ctx).Info().Msg("OCSP updated")
 				ocspUpdated <- true
 			}
 		}
@@ -276,7 +278,7 @@ func TestConfig(t *testing.T) {
 			certValidTime = &cert.Leaf.NotAfter
 		} else {
 			if !certValidTime.Equal(cert.Leaf.NotAfter) {
-				log.Info(ctx).Msg("domain renewed")
+				log.Ctx(ctx).Info().Msg("domain renewed")
 				domainRenewed <- true
 			}
 		}
@@ -314,7 +316,7 @@ func TestRedirect(t *testing.T) {
 			},
 		},
 	})
-	_, err = New(src)
+	_, err = New(context.Background(), src)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -324,7 +326,7 @@ func TestRedirect(t *testing.T) {
 	}
 
 	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
@@ -356,7 +358,7 @@ func waitFor(addr string) error {
 	return err
 }
 
-func readJWSPayload(r io.Reader, dst interface{}) {
+func readJWSPayload(r io.Reader, dst any) {
 	var req struct {
 		Protected string `json:"protected"`
 		Payload   string `json:"payload"`
@@ -385,8 +387,8 @@ func Test_configureCertificateAuthority(t *testing.T) {
 		expected *certmagic.ACMEIssuer
 		wantErr  bool
 	}
-	var tests = map[string]func(t *testing.T) test{
-		"ok/default": func(t *testing.T) test {
+	tests := map[string]func(t *testing.T) test{
+		"ok/default": func(_ *testing.T) test {
 			return test{
 				args: args{
 					acmeMgr: newACMEIssuer(),
@@ -395,12 +397,13 @@ func Test_configureCertificateAuthority(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					Agreed: true,
 					CA:     certmagic.DefaultACME.CA,
+					Email:  " ",
 					TestCA: certmagic.DefaultACME.TestCA,
 				},
 				wantErr: false,
 			}
 		},
-		"ok/staging": func(t *testing.T) test {
+		"ok/staging": func(_ *testing.T) test {
 			return test{
 				args: args{
 					acmeMgr: newACMEIssuer(),
@@ -411,12 +414,13 @@ func Test_configureCertificateAuthority(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					Agreed: true,
 					CA:     certmagic.DefaultACME.TestCA,
+					Email:  " ",
 					TestCA: certmagic.DefaultACME.TestCA,
 				},
 				wantErr: false,
 			}
 		},
-		"ok/custom-ca-staging": func(t *testing.T) test {
+		"ok/custom-ca-staging": func(_ *testing.T) test {
 			return test{
 				args: args{
 					acmeMgr: newACMEIssuer(),
@@ -459,8 +463,8 @@ func Test_configureExternalAccountBinding(t *testing.T) {
 		expected *certmagic.ACMEIssuer
 		wantErr  bool
 	}
-	var tests = map[string]func(t *testing.T) test{
-		"ok": func(t *testing.T) test {
+	tests := map[string]func(t *testing.T) test{
+		"ok": func(_ *testing.T) test {
 			return test{
 				args: args{
 					acmeMgr: newACMEIssuer(),
@@ -480,7 +484,7 @@ func Test_configureExternalAccountBinding(t *testing.T) {
 				wantErr: false,
 			}
 		},
-		"fail/error-decoding-mac-key": func(t *testing.T) test {
+		"fail/error-decoding-mac-key": func(_ *testing.T) test {
 			return test{
 				args: args{
 					acmeMgr: newACMEIssuer(),
@@ -521,11 +525,11 @@ func Test_configureTrustedRoots(t *testing.T) {
 		wantErr  bool
 		cleanup  func()
 	}
-	var tests = map[string]func(t *testing.T) test{
+	tests := map[string]func(t *testing.T) test{
 		"ok/pem": func(t *testing.T) test {
-			copy, err := x509.SystemCertPool()
+			roots, err := x509.SystemCertPool()
 			require.NoError(t, err)
-			ok := copy.AppendCertsFromPEM(ca.certPEM)
+			ok := roots.AppendCertsFromPEM(ca.certPEM)
 			require.Equal(t, true, ok)
 			return test{
 				args: args{
@@ -537,15 +541,15 @@ func Test_configureTrustedRoots(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					CA:           certmagic.DefaultACME.CA,
 					TestCA:       certmagic.DefaultACME.TestCA,
-					TrustedRoots: copy,
+					TrustedRoots: roots,
 				},
 				wantErr: false,
 			}
 		},
 		"ok/file": func(t *testing.T) test {
-			copy, err := x509.SystemCertPool()
+			roots, err := x509.SystemCertPool()
 			require.NoError(t, err)
-			ok := copy.AppendCertsFromPEM(ca.certPEM)
+			ok := roots.AppendCertsFromPEM(ca.certPEM)
 			require.Equal(t, true, ok)
 			f, err := os.CreateTemp("", "pomerium-test-ca")
 			require.NoError(t, err)
@@ -562,7 +566,7 @@ func Test_configureTrustedRoots(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					CA:           certmagic.DefaultACME.CA,
 					TestCA:       certmagic.DefaultACME.TestCA,
-					TrustedRoots: copy,
+					TrustedRoots: roots,
 				},
 				wantErr: false,
 				cleanup: func() {
@@ -571,7 +575,7 @@ func Test_configureTrustedRoots(t *testing.T) {
 			}
 		},
 		"fail/pem": func(t *testing.T) test {
-			copy, err := x509.SystemCertPool()
+			roots, err := x509.SystemCertPool()
 			require.NoError(t, err)
 			return test{
 				args: args{
@@ -583,13 +587,13 @@ func Test_configureTrustedRoots(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					CA:           certmagic.DefaultACME.CA,
 					TestCA:       certmagic.DefaultACME.TestCA,
-					TrustedRoots: copy,
+					TrustedRoots: roots,
 				},
 				wantErr: true,
 			}
 		},
 		"fail/file": func(t *testing.T) test {
-			copy, err := x509.SystemCertPool()
+			roots, err := x509.SystemCertPool()
 			require.NoError(t, err)
 			return test{
 				args: args{
@@ -601,7 +605,7 @@ func Test_configureTrustedRoots(t *testing.T) {
 				expected: &certmagic.ACMEIssuer{
 					CA:           certmagic.DefaultACME.CA,
 					TestCA:       certmagic.DefaultACME.TestCA,
-					TrustedRoots: copy,
+					TrustedRoots: roots,
 				},
 				wantErr: true,
 			}
@@ -625,4 +629,24 @@ func Test_configureTrustedRoots(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShouldEnableHTTPChallenge(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, shouldEnableHTTPChallenge(nil))
+	assert.False(t, shouldEnableHTTPChallenge(&config.Config{}))
+	assert.False(t, shouldEnableHTTPChallenge(&config.Config{Options: &config.Options{}}))
+	assert.False(t, shouldEnableHTTPChallenge(&config.Config{Options: &config.Options{
+		HTTPRedirectAddr: ":8080",
+	}}))
+	assert.False(t, shouldEnableHTTPChallenge(&config.Config{Options: &config.Options{
+		HTTPRedirectAddr: "127.0.0.1:8080",
+	}}))
+	assert.True(t, shouldEnableHTTPChallenge(&config.Config{Options: &config.Options{
+		HTTPRedirectAddr: ":80",
+	}}))
+	assert.True(t, shouldEnableHTTPChallenge(&config.Config{Options: &config.Options{
+		HTTPRedirectAddr: "127.0.0.1:80",
+	}}))
 }

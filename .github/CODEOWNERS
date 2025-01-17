@@ -1,3 +1,2 @@
 * @pomerium/dev-backend
-/docs/  @ghost
-/package.json @pomerium/docs @pomerium/dev
+ui/ @pomerium/dev-frontend

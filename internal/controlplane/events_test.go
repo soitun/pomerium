@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	databrokerpb "github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/grpc/events"
@@ -49,11 +51,11 @@ func TestEvents(t *testing.T) {
 
 		grpcSrv := grpc.NewServer()
 		databrokerpb.RegisterDataBrokerServiceServer(grpcSrv, &mockDataBrokerServer{
-			put: func(ctx context.Context, req *databrokerpb.PutRequest) (*databrokerpb.PutResponse, error) {
+			put: func(_ context.Context, req *databrokerpb.PutRequest) (*databrokerpb.PutResponse, error) {
 				putRequest = req
 				return new(databrokerpb.PutResponse), nil
 			},
-			setOptions: func(ctx context.Context, req *databrokerpb.SetOptionsRequest) (*databrokerpb.SetOptionsResponse, error) {
+			setOptions: func(_ context.Context, req *databrokerpb.SetOptionsRequest) (*databrokerpb.SetOptionsResponse, error) {
 				setOptionsRequest = req
 				return new(databrokerpb.SetOptionsResponse), nil
 			},
@@ -73,24 +75,23 @@ func TestEvents(t *testing.T) {
 
 			srv := &Server{
 				haveSetCapacity: make(map[string]bool),
-			}
-			srv.currentConfig.Store(versionedConfig{
-				Config: &config.Config{
+				currentConfig: atomicutil.NewValue(&config.Config{
 					OutboundPort: outboundPort,
 					Options: &config.Options{
 						SharedKey:           cryptutil.NewBase64Key(),
 						DataBrokerURLString: "http://" + li.Addr().String(),
-						GRPCInsecure:        true,
+						GRPCInsecure:        proto.Bool(true),
 					},
 				},
-			})
-			err := srv.storeEvent(ctx, new(events.EnvoyConfigurationEvent))
+				),
+			}
+			err := srv.storeEvent(ctx, new(events.LastError))
 			assert.NoError(t, err)
 			return err
 		})
 		_ = eg.Wait()
 
 		assert.Equal(t, uint64(maxEvents), setOptionsRequest.GetOptions().GetCapacity())
-		assert.Equal(t, "type.googleapis.com/pomerium.events.EnvoyConfigurationEvent", putRequest.GetRecord().GetType())
+		assert.Equal(t, "type.googleapis.com/pomerium.events.LastError", putRequest.GetRecord().GetType())
 	})
 }

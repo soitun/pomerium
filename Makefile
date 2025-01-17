@@ -13,7 +13,7 @@ BUILDTAGS :=
 
 # Populate version variables
 # Add to compile time flags
-VERSION := $(shell git describe --tags)
+VERSION?= $(shell git describe --tags)
 GITCOMMIT := $(shell git rev-parse --short HEAD)
 BUILDMETA:=
 GITUNTRACKEDCHANGES := $(shell git status --porcelain --untracked-files=no)
@@ -35,18 +35,12 @@ GETENVOY_VERSION = v0.2.0
 GORELEASER_VERSION = v0.174.2
 
 .PHONY: all
-all: clean build-deps test lint spellcheck build ## Runs a clean, build, fmt, lint, test, and vet.
-
-
-.PHONY: generate-mocks
-generate-mocks: ## Generate mocks
-	@echo "==> $@"
-	@go run github.com/golang/mock/mockgen -destination internal/directory/auth0/mock_auth0/mock.go github.com/pomerium/pomerium/internal/directory/auth0 RoleManager
+all: clean build-deps test lint build ## Runs a clean, build, fmt, lint, test, and vet.
 
 .PHONY: get-envoy
 get-envoy: ## Fetch envoy binaries
 	@echo "==> $@"
-	@./scripts/get-envoy.bash
+	@cd pkg/envoy/files && env -u GOOS go run ../get-envoy
 
 .PHONY: deps-build
 deps-build: get-envoy ## Install build dependencies
@@ -61,11 +55,6 @@ deps-release: get-envoy ## Install release dependencies
 build-deps: deps-build deps-release
 	@echo "==> $@"
 
-.PHONY: docs
-docs: ## Start the vuepress docs development server
-	@echo "==> $@"
-	@yarn && yarn docs:dev
-
 .PHONY: tag
 tag: ## Create a new git tag to prepare to build a release
 	git tag -sa $(VERSION) -m "$(VERSION)"
@@ -76,8 +65,13 @@ proto:
 	@echo "==> $@"
 	cd pkg/grpc && ./protoc.bash
 
+.PHONY: generate
+generate: proto
+	@echo "==> $@"
+	$(GO) generate ./...
+
 .PHONY: build
-build: build-go build-ui
+build: build-ui build-go
 	@echo "==> $@"
 
 .PHONY: build-debug
@@ -98,17 +92,12 @@ build-ui: yarn
 .PHONY: lint
 lint: ## Verifies `golint` passes.
 	@echo "==> $@"
-	@$(GO) run github.com/golangci/golangci-lint/cmd/golangci-lint run ./...
+	@go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.60.1 run ./... --fix
 
 .PHONY: test
 test: get-envoy ## Runs the go tests.
 	@echo "==> $@"
-	@$(GO) test -tags "$(BUILDTAGS)" $(shell $(GO) list ./... | grep -v vendor | grep -v github.com/pomerium/pomerium/integration)
-
-.PHONY: spellcheck
-spellcheck: # Spellcheck docs
-	@echo "==> Spell checking docs..."
-	@$(GO) run github.com/client9/misspell/cmd/misspell -error -source=text docs/
+	@$(GO) test -race -tags "$(BUILDTAGS)" $(shell $(GO) list ./... | grep -v vendor | grep -v github.com/pomerium/pomerium/integration)
 
 .PHONY: cover
 cover: get-envoy ## Runs go test with coverage
@@ -123,8 +112,8 @@ clean: ## Cleanup any build binaries or packages.
 	@echo "==> $@"
 	$(RM) -r $(BINDIR)
 	$(RM) -r $(BUILDDIR)
-	$(RM) internal/envoy/files/envoy-*
-	$(RM) $GOPATH/bin/protoc-gen-validate
+	$(RM) pkg/envoy/files/envoy-*
+	$(RM) $(GOPATH)/bin/protoc-gen-validate
 	$(RM) -r /tmp/pomerium-protoc
 	$(RM) -r /tmp/pomerium-protoc-3pp
 
@@ -137,13 +126,6 @@ snapshot: build-deps ## Builds the cross-compiled binaries, naming them in such 
 yarn:
 	@echo "==> $@"
 	cd ui ; yarn install --network-timeout 120000
-
-.PHONY: gen-docs
-gen-docs:
-	@echo "==> $@"
-	pip3 install ruamel.yaml
-	python3 ./scripts/generate-settings-docs.py
-	node scripts/generate-console-pages.js
 
 .PHONY: help
 help:

@@ -22,7 +22,7 @@ func TestMetricsManager(t *testing.T) {
 	mgr := NewMetricsManager(ctx, src)
 	srv1 := httptest.NewServer(mgr)
 	defer srv1.Close()
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "ERROR", http.StatusInternalServerError)
 	}))
 	defer srv2.Close()
@@ -52,7 +52,7 @@ func TestMetricsManagerBasicAuth(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, res.StatusCode)
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/metrics", srv1.URL), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/metrics", srv1.URL), nil)
 	require.NoError(t, err)
 	req.SetBasicAuth("x", "y")
 	res, err = http.DefaultClient.Do(req)

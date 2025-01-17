@@ -2,61 +2,76 @@ package authorize
 
 import (
 	"context"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
 	envoy_service_auth_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/pomerium/pomerium/authorize/evaluator"
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/config/envoyconfig"
 	"github.com/pomerium/pomerium/internal/httputil"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
 	"github.com/pomerium/pomerium/internal/urlutil"
+	"github.com/pomerium/pomerium/pkg/contextutil"
+	"github.com/pomerium/pomerium/pkg/grpc/user"
+	"github.com/pomerium/pomerium/pkg/storage"
+	"github.com/pomerium/pomerium/pkg/telemetry/requestid"
 )
 
 // Check implements the envoy auth server gRPC endpoint.
-func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v3.CheckRequest) (out *envoy_service_auth_v3.CheckResponse, err error) {
+func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v3.CheckRequest) (*envoy_service_auth_v3.CheckResponse, error) {
 	ctx, span := trace.StartSpan(ctx, "authorize.grpc.Check")
 	defer span.End()
 
-	// wait for the initial sync to complete so that data is available for evaluation
-	if err := a.WaitForInitialSync(ctx); err != nil {
-		return nil, err
-	}
+	querier := storage.NewTracingQuerier(
+		storage.NewCachingQuerier(
+			storage.NewCachingQuerier(
+				storage.NewQuerier(a.state.Load().dataBrokerClient),
+				a.globalCache,
+			),
+			storage.NewLocalCache(),
+		),
+	)
+	ctx = storage.WithQuerier(ctx, querier)
 
 	state := a.state.Load()
 
 	// convert the incoming envoy-style http request into a go-style http request
 	hreq := getHTTPRequestFromCheckRequest(in)
+	requestID := requestid.FromHTTPHeader(hreq.Header)
+	ctx = requestid.WithValue(ctx, requestID)
 
-	isForwardAuth := a.isForwardAuth(in)
-	if isForwardAuth {
-		// update the incoming http request's uri to match the forwarded URI
-		fwdAuthURI := getForwardAuthURL(hreq)
-		in.Attributes.Request.Http.Scheme = fwdAuthURI.Scheme
-		in.Attributes.Request.Http.Host = fwdAuthURI.Host
-		in.Attributes.Request.Http.Path = fwdAuthURI.EscapedPath()
-		if fwdAuthURI.RawQuery != "" {
-			in.Attributes.Request.Http.Path += "?" + fwdAuthURI.RawQuery
+	sessionState, _ := state.sessionStore.LoadSessionStateAndCheckIDP(hreq)
+
+	var s sessionOrServiceAccount
+	var u *user.User
+	var err error
+	if sessionState != nil {
+		s, err = a.getDataBrokerSessionOrServiceAccount(ctx, sessionState.ID, sessionState.DatabrokerRecordVersion)
+		if status.Code(err) == codes.Unavailable {
+			log.Ctx(ctx).Debug().Str("request-id", requestID).Err(err).Msg("temporary error checking authorization: data broker unavailable")
+			return nil, err
+		} else if err != nil {
+			log.Ctx(ctx).Info().Err(err).Str("request-id", requestID).Msg("clearing session due to missing or invalid session or service account")
+			sessionState = nil
 		}
 	}
-
-	rawJWT, _ := loadRawSession(hreq, a.currentOptions.Load(), state.encoder)
-	sessionState, _ := loadSession(state.encoder, rawJWT)
-
-	s, u, err := a.forceSync(ctx, sessionState)
-	if err != nil {
-		log.Warn(ctx).Err(err).Msg("clearing session due to force sync failed")
-		sessionState = nil
+	if sessionState != nil && s != nil {
+		u, _ = a.getDataBrokerUser(ctx, s.GetUserId()) // ignore any missing user error
 	}
 
-	req, err := a.getEvaluatorRequestFromCheckRequest(in, sessionState)
+	req, err := a.getEvaluatorRequestFromCheckRequest(ctx, in, sessionState)
 	if err != nil {
-		log.Warn(ctx).Err(err).Msg("error building evaluator request")
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("error building evaluator request")
 		return nil, err
 	}
 
@@ -65,75 +80,39 @@ func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v3.CheckRe
 	res, err := state.evaluator.Evaluate(ctx, req)
 	a.stateLock.RUnlock()
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("error during OPA evaluation")
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("error during OPA evaluation")
 		return nil, err
 	}
-	defer func() {
-		a.logAuthorizeCheck(ctx, in, out, res, s, u)
-	}()
 
-	isForwardAuthVerify := isForwardAuth && hreq.URL.Path == "/verify"
-
-	// if there's a deny, the result is denied using the deny reasons.
-	if res.Deny.Value {
-		return a.handleResultDenied(ctx, in, req, res, isForwardAuthVerify, res.Deny.Reasons)
+	// if show error details is enabled, attach the policy evaluation traces
+	if req.Policy != nil && req.Policy.ShowErrorDetails {
+		ctx = contextutil.WithPolicyEvaluationTraces(ctx, res.Traces)
 	}
 
-	// if there's an allow, the result is allowed.
-	if res.Allow.Value {
-		return a.handleResultAllowed(ctx, in, res)
+	resp, err := a.handleResult(ctx, in, req, res)
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("grpc check ext_authz_error")
 	}
-
-	// otherwise, the result is denied using the allow reasons.
-	return a.handleResultDenied(ctx, in, req, res, isForwardAuthVerify, res.Allow.Reasons)
-}
-
-func getForwardAuthURL(r *http.Request) *url.URL {
-	urqQuery := r.URL.Query().Get("uri")
-	u, _ := urlutil.ParseAndValidateURL(urqQuery)
-	if u == nil {
-		u = &url.URL{
-			Scheme: r.Header.Get(httputil.HeaderForwardedProto),
-			Host:   r.Header.Get(httputil.HeaderForwardedHost),
-			Path:   r.Header.Get(httputil.HeaderForwardedURI),
-		}
-	}
-	originalURL := r.Header.Get(httputil.HeaderOriginalURL)
-	if originalURL != "" {
-		k, _ := urlutil.ParseAndValidateURL(originalURL)
-		if k != nil {
-			u = k
-		}
-	}
-	return u
-}
-
-// isForwardAuth returns if the current request is a forward auth route.
-func (a *Authorize) isForwardAuth(req *envoy_service_auth_v3.CheckRequest) bool {
-	opts := a.currentOptions.Load()
-
-	forwardAuthURL, err := opts.GetForwardAuthURL()
-	if err != nil || forwardAuthURL == nil {
-		return false
-	}
-
-	checkURL := getCheckRequestURL(req)
-
-	return urlutil.StripPort(checkURL.Host) == urlutil.StripPort(forwardAuthURL.Host)
+	a.logAuthorizeCheck(ctx, in, res, s, u)
+	return resp, err
 }
 
 func (a *Authorize) getEvaluatorRequestFromCheckRequest(
+	ctx context.Context,
 	in *envoy_service_auth_v3.CheckRequest,
 	sessionState *sessions.State,
 ) (*evaluator.Request, error) {
 	requestURL := getCheckRequestURL(in)
+	attrs := in.GetAttributes()
+	clientCertMetadata := attrs.GetMetadataContext().GetFilterMetadata()["com.pomerium.client-certificate-info"]
 	req := &evaluator.Request{
+		IsInternal: envoyconfig.ExtAuthzContextExtensionsIsInternal(attrs.GetContextExtensions()),
 		HTTP: evaluator.NewRequestHTTP(
-			in.GetAttributes().GetRequest().GetHttp().GetMethod(),
+			attrs.GetRequest().GetHttp().GetMethod(),
 			requestURL,
 			getCheckRequestHeaders(in),
-			getPeerCertificate(in),
-			in.GetAttributes().GetSource().GetAddress().GetSocketAddress().GetAddress(),
+			getClientCertificateInfo(ctx, clientCertMetadata),
+			attrs.GetSource().GetAddress().GetSocketAddress().GetAddress(),
 		),
 	}
 	if sessionState != nil {
@@ -141,16 +120,17 @@ func (a *Authorize) getEvaluatorRequestFromCheckRequest(
 			ID: sessionState.ID,
 		}
 	}
-	req.Policy = a.getMatchingPolicy(requestURL)
+	req.Policy = a.getMatchingPolicy(envoyconfig.ExtAuthzContextExtensionsRouteID(attrs.GetContextExtensions()))
 	return req, nil
 }
 
-func (a *Authorize) getMatchingPolicy(requestURL url.URL) *config.Policy {
+func (a *Authorize) getMatchingPolicy(routeID uint64) *config.Policy {
 	options := a.currentOptions.Load()
 
-	for _, p := range options.GetAllPolicies() {
-		if p.Matches(requestURL) {
-			return &p
+	for p := range options.GetAllPolicies() {
+		id, _ := p.RouteID()
+		if id == routeID {
+			return p
 		}
 	}
 
@@ -178,7 +158,7 @@ func getCheckRequestHeaders(req *envoy_service_auth_v3.CheckRequest) map[string]
 	hdrs := make(map[string]string)
 	ch := req.GetAttributes().GetRequest().GetHttp().GetHeaders()
 	for k, v := range ch {
-		hdrs[http.CanonicalHeaderKey(k)] = v
+		hdrs[httputil.CanonicalHeaderKey(k)] = v
 	}
 	return hdrs
 }
@@ -189,11 +169,12 @@ func getCheckRequestURL(req *envoy_service_auth_v3.CheckRequest) url.URL {
 		Scheme: h.GetScheme(),
 		Host:   h.GetHost(),
 	}
-	u.Host = urlutil.GetDomainsForURL(u)[0]
+	u.Host = urlutil.GetDomainsForURL(&u, false)[0]
 	// envoy sends the query string as part of the path
 	path := h.GetPath()
 	if idx := strings.Index(path, "?"); idx != -1 {
 		u.RawPath, u.RawQuery = path[:idx], path[idx+1:]
+		u.RawQuery = u.Query().Encode()
 	} else {
 		u.RawPath = path
 	}
@@ -201,9 +182,37 @@ func getCheckRequestURL(req *envoy_service_auth_v3.CheckRequest) url.URL {
 	return u
 }
 
-// getPeerCertificate gets the PEM-encoded peer certificate from the check request
-func getPeerCertificate(in *envoy_service_auth_v3.CheckRequest) string {
-	// ignore the error as we will just return the empty string in that case
-	cert, _ := url.QueryUnescape(in.GetAttributes().GetSource().GetCertificate())
-	return cert
+// getClientCertificateInfo translates from the client certificate Envoy
+// metadata to the ClientCertificateInfo type.
+func getClientCertificateInfo(
+	ctx context.Context, metadata *structpb.Struct,
+) evaluator.ClientCertificateInfo {
+	var c evaluator.ClientCertificateInfo
+	if metadata == nil {
+		return c
+	}
+	c.Presented = metadata.Fields["presented"].GetBoolValue()
+	escapedChain := metadata.Fields["chain"].GetStringValue()
+	if escapedChain == "" {
+		// No validated client certificate.
+		return c
+	}
+
+	chain, err := url.QueryUnescape(escapedChain)
+	if err != nil {
+		log.Ctx(ctx).Error().Str("chain", escapedChain).Err(err).
+			Msg(`received unexpected client certificate "chain" value`)
+		return c
+	}
+
+	// Split the chain into the leaf and any intermediate certificates.
+	p, rest := pem.Decode([]byte(chain))
+	if p == nil {
+		log.Ctx(ctx).Error().Str("chain", escapedChain).
+			Msg(`received unexpected client certificate "chain" value (no PEM block found)`)
+		return c
+	}
+	c.Leaf = string(pem.EncodeToMemory(p))
+	c.Intermediates = string(rest)
+	return c
 }

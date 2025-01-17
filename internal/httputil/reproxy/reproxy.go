@@ -29,13 +29,13 @@ type Handler struct {
 	mu       sync.RWMutex
 	key      []byte
 	options  *config.Options
-	policies map[uint64]config.Policy
+	policies map[uint64]*config.Policy
 }
 
 // New creates a new Handler.
 func New() *Handler {
 	h := new(Handler)
-	h.policies = make(map[uint64]config.Policy)
+	h.policies = make(map[uint64]*config.Policy)
 	return h
 }
 
@@ -112,15 +112,15 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 			return httputil.NewError(http.StatusNotFound, errors.New("policy destination not found"))
 		}
 		// regular rand is fine for this
-		dst := dsts[rand.Intn(len(dsts))] // nolint:gosec
+		dst := dsts[rand.Intn(len(dsts))] //nolint:gosec
 
 		// when SPDY is being used, disable HTTP/2 because the two can't be used together with the reverse proxy
 		// Issue #2126
-		disableHTTP2 := isSPDY(r)
+		disableHTTP2 := isSPDY(r) || isWebsocket(r)
 
 		h := stdhttputil.NewSingleHostReverseProxy(&dst)
 		h.ErrorLog = stdlog.New(log.Logger(), "", 0)
-		h.Transport = config.NewPolicyHTTPTransport(options, &policy, disableHTTP2)
+		h.Transport = config.NewPolicyHTTPTransport(options, policy, disableHTTP2)
 		h.ServeHTTP(w, r)
 		return nil
 	})
@@ -133,11 +133,11 @@ func (h *Handler) Update(ctx context.Context, cfg *config.Config) {
 
 	h.key, _ = cfg.Options.GetSharedKey()
 	h.options = cfg.Options
-	h.policies = make(map[uint64]config.Policy)
-	for _, p := range cfg.Options.GetAllPolicies() {
+	h.policies = make(map[uint64]*config.Policy, cfg.Options.NumPolicies())
+	for p := range cfg.Options.GetAllPolicies() {
 		id, err := p.RouteID()
 		if err != nil {
-			log.Warn(ctx).Err(err).Msg("reproxy: error getting route id")
+			log.Ctx(ctx).Error().Err(err).Msg("reproxy: error getting route id")
 			continue
 		}
 		h.policies[id] = p
@@ -146,4 +146,8 @@ func (h *Handler) Update(ctx context.Context, cfg *config.Config) {
 
 func isSPDY(r *http.Request) bool {
 	return strings.HasPrefix(strings.ToLower(r.Header.Get(httputil.HeaderUpgrade)), "spdy/")
+}
+
+func isWebsocket(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(r.Header.Get(httputil.HeaderUpgrade)), "websocket/")
 }

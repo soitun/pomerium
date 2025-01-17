@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -126,7 +126,7 @@ func TestLeaser(t *testing.T) {
 			AnyTimes()
 		handler.EXPECT().
 			RunLeased(gomock.Any()).
-			DoAndReturn(func(ctx context.Context) error {
+			DoAndReturn(func(_ context.Context) error {
 				time.Sleep(time.Millisecond * 20)
 				return exitErr
 			}).
@@ -162,14 +162,14 @@ func TestLeasers(t *testing.T) {
 		Times(1)
 
 	var counter int64
-	fn1 := func(ctx context.Context) error {
+	fn1 := func(_ context.Context) error {
 		atomic.AddInt64(&counter, 1)
 		return exitErr
 	}
 	fn2 := func(ctx context.Context) error {
 		atomic.AddInt64(&counter, 10)
 		<-ctx.Done()
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 	leaser := databroker.NewLeasers("TEST", time.Second*30, client, fn1, fn2)
 	err := leaser.Run(context.Background())

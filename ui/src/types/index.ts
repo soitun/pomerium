@@ -13,8 +13,11 @@ export type Group = {
   name: string;
 };
 
+export type Profile = {
+  claims: Record<string, unknown>;
+};
+
 export type Session = {
-  audience: string[];
   claims: Claims;
   deviceCredentials: Array<{
     typeId: string;
@@ -22,20 +25,6 @@ export type Session = {
   }>;
   expiresAt: string;
   id: string;
-  idToken: {
-    expiresAt: string;
-    issuedAt: string;
-    issuer: string;
-    raw: string;
-    subject: string;
-  };
-  issuedAt: string;
-  oauthToken: {
-    accessToken: string;
-    expiresAt: string;
-    refreshToken: string;
-    tokenType: string;
-  };
   userId: string;
 };
 
@@ -58,6 +47,7 @@ export type WebAuthnCreationOptions = {
   pubKeyCredParams: PublicKeyCredentialParameters[];
   rp: {
     name: string;
+    id: string;
   };
   timeout: number;
   user: {
@@ -75,31 +65,40 @@ export type WebAuthnRequestOptions = {
   challenge: string;
   timeout: number;
   userVerification: UserVerificationRequirement;
+  rpId: string;
 };
 
 // page data
 
 type BasePageData = {
   csrfToken?: string;
+  primaryColor?: string;
+  secondaryColor?: string;
+  logoUrl?: string;
+  faviconUrl?: string;
 };
 
 export type ErrorPageData = BasePageData & {
-  page: "Error";
+  page: "Error" | "UpstreamError";
 
   canDebug?: boolean;
   debugUrl?: string;
-  error?: string;
   requestId?: string;
   status?: number;
   statusText?: string;
+  description?: string;
+  errorMessageFirstParagraph?: string;
+  policyEvaluationTraces?: PolicyEvaluationTrace[];
 };
 
 export type UserInfoData = {
   csrfToken: string;
   directoryGroups?: Group[];
   directoryUser?: DirectoryUser;
+  isEnterprise?: boolean;
   session?: Session;
   user?: User;
+  profile?: Profile;
   webAuthnCreationOptions?: WebAuthnCreationOptions;
   webAuthnRequestOptions?: WebAuthnRequestOptions;
   webAuthnUrl?: string;
@@ -113,6 +112,10 @@ export type DeviceEnrolledPageData = BasePageData &
 export type SignOutConfirmPageData = BasePageData & {
   page: "SignOutConfirm";
   url: string;
+};
+
+export type SignedOutPageData = BasePageData & {
+  page: "SignedOut";
 };
 
 export type UserInfoPageData = BasePageData &
@@ -133,5 +136,14 @@ export type PageData =
   | ErrorPageData
   | DeviceEnrolledPageData
   | SignOutConfirmPageData
+  | SignedOutPageData
   | UserInfoPageData
   | WebAuthnRegistrationPageData;
+
+export type PolicyEvaluationTrace = {
+  id?: string;
+  explanation?: string;
+  remediation?: string;
+  allow?: boolean;
+  deny?: boolean;
+};

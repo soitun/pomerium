@@ -10,18 +10,36 @@ import (
 func newSyncLatestRecordStream(
 	ctx context.Context,
 	backend *Backend,
-) storage.RecordStream {
+	recordType string,
+	expr storage.FilterExpression,
+) (storage.RecordStream, error) {
+	filter, err := storage.RecordStreamFilterFromFilterExpression(expr)
+	if err != nil {
+		return nil, err
+	}
+	if recordType != "" {
+		filter = filter.And(func(record *databroker.Record) (keep bool) {
+			return record.GetType() == recordType
+		})
+	}
+
 	var ready []*databroker.Record
-	return storage.NewRecordStream(ctx, backend.closed, []storage.RecordStreamGenerator{
-		func(ctx context.Context, block bool) (*databroker.Record, error) {
-			backend.mu.RLock()
-			for _, co := range backend.lookup {
-				ready = append(ready, co.List()...)
+	generator := func(_ context.Context, _ bool) (*databroker.Record, error) {
+		backend.mu.RLock()
+		for _, co := range backend.lookup {
+			for _, record := range co.List() {
+				if filter(record) {
+					ready = append(ready, record)
+				}
 			}
-			backend.mu.RUnlock()
-			return nil, storage.ErrStreamDone
-		},
-		func(ctx context.Context, block bool) (*databroker.Record, error) {
+		}
+		backend.mu.RUnlock()
+		return nil, storage.ErrStreamDone
+	}
+
+	return storage.NewRecordStream(ctx, backend.closed, []storage.RecordStreamGenerator{
+		generator,
+		func(_ context.Context, _ bool) (*databroker.Record, error) {
 			if len(ready) == 0 {
 				return nil, storage.ErrStreamDone
 			}
@@ -30,12 +48,13 @@ func newSyncLatestRecordStream(
 			ready = ready[1:]
 			return dup(record), nil
 		},
-	}, nil)
+	}, nil), nil
 }
 
 func newSyncRecordStream(
 	ctx context.Context,
 	backend *Backend,
+	recordType string,
 	recordVersion uint64,
 ) storage.RecordStream {
 	changed := backend.onChange.Bind()
@@ -49,7 +68,7 @@ func newSyncRecordStream(
 			}
 
 			for {
-				ready = backend.getSince(recordVersion)
+				ready = backend.getSince(recordType, recordVersion)
 
 				if len(ready) > 0 {
 					// records are sorted by version,

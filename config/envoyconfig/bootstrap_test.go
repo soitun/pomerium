@@ -1,6 +1,7 @@
 package envoyconfig
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,7 @@ import (
 )
 
 func TestBuilder_BuildBootstrapAdmin(t *testing.T) {
+	t.Setenv("TMPDIR", "/tmp")
 	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
 	t.Run("valid", func(t *testing.T) {
 		adminCfg, err := b.BuildBootstrapAdmin(&config.Config{
@@ -22,21 +24,13 @@ func TestBuilder_BuildBootstrapAdmin(t *testing.T) {
 		testutil.AssertProtoJSONEqual(t, `
 			{
 				"address": {
-					"socketAddress": {
-						"address": "127.0.0.1",
-						"portValue": 9901
+					"pipe": {
+						"mode": 384,
+						"path": "/tmp/`+envoyAdminAddressSockName+`"
 					}
 				}
 			}
 		`, adminCfg)
-	})
-	t.Run("bad address", func(t *testing.T) {
-		_, err := b.BuildBootstrapAdmin(&config.Config{
-			Options: &config.Options{
-				EnvoyAdminAddress: "xyz1234:zyx4321",
-			},
-		})
-		assert.Error(t, err)
 	})
 }
 
@@ -48,8 +42,11 @@ func TestBuilder_BuildBootstrapLayeredRuntime(t *testing.T) {
 		{ "layers": [{
 			"name": "static_layer_0",
 			"staticLayer": {
-				"overload": {
-					"global_downstream_max_connections": 50000
+				"re2": {
+					"max_program_size": {
+						"error_level": 1048576,
+						"warn_level": 1024
+					}
 				}
 			}
 		}] }
@@ -59,7 +56,7 @@ func TestBuilder_BuildBootstrapLayeredRuntime(t *testing.T) {
 func TestBuilder_BuildBootstrapStaticResources(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		b := New("localhost:1111", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
-		staticCfg, err := b.BuildBootstrapStaticResources()
+		staticCfg, err := b.BuildBootstrapStaticResources(context.Background(), &config.Config{}, false)
 		assert.NoError(t, err)
 		testutil.AssertProtoJSONEqual(t, `
 			{
@@ -103,7 +100,7 @@ func TestBuilder_BuildBootstrapStaticResources(t *testing.T) {
 	})
 	t.Run("bad gRPC address", func(t *testing.T) {
 		b := New("xyz:zyx", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
-		_, err := b.BuildBootstrapStaticResources()
+		_, err := b.BuildBootstrapStaticResources(context.Background(), &config.Config{}, false)
 		assert.Error(t, err)
 	})
 }
@@ -125,5 +122,30 @@ func TestBuilder_BuildBootstrapStatsConfig(t *testing.T) {
 				}]
 			}
 		`, statsCfg)
+	})
+}
+
+func TestBuilder_BuildBootstrap(t *testing.T) {
+	b := New("localhost:1111", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
+	t.Run("OverloadManager", func(t *testing.T) {
+		bootstrap, err := b.BuildBootstrap(context.Background(), &config.Config{
+			Options: &config.Options{
+				EnvoyAdminAddress: "localhost:9901",
+			},
+		}, false)
+		assert.NoError(t, err)
+		testutil.AssertProtoJSONEqual(t, `
+			{
+				"resourceMonitors": [
+					{
+						"name": "envoy.resource_monitors.global_downstream_max_connections",
+						"typedConfig": {
+							"@type": "type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig",
+							"maxActiveDownstreamConnections": "50000"
+						}
+					}
+				]
+			}
+		`, bootstrap.OverloadManager)
 	})
 }

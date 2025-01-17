@@ -15,7 +15,9 @@ import (
 
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/config/envoyconfig/filemgr"
+	"github.com/pomerium/pomerium/internal/httputil/reproxy"
 	"github.com/pomerium/pomerium/internal/testutil"
+	"github.com/pomerium/pomerium/pkg/cryptutil"
 )
 
 func policyNameFunc() func(*config.Policy) string {
@@ -54,27 +56,43 @@ func Test_buildGRPCRoutes(t *testing.T) {
 
 func Test_buildPomeriumHTTPRoutes(t *testing.T) {
 	b := &Builder{filemgr: filemgr.NewManager()}
-	routeString := func(typ, name string, protected bool) string {
+	routeString := func(typ, name string) string {
 		str := `{
-				"name": "pomerium-` + typ + `-` + name + `",
-				"match": {
-					"` + typ + `": "` + name + `"
+			"name": "pomerium-` + typ + `-` + name + `",
+			"match": {
+				"` + typ + `": "` + name + `"
+			},
+			"responseHeadersToAdd": [
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+						"key": "X-Frame-Options",
+						"value": "SAMEORIGIN"
+					}
 				},
-				"route": {
-					"cluster": "pomerium-control-plane-http"
-				}
-			`
-		if !protected {
-			str += `,
-				"typedPerFilterConfig": {
-					"envoy.filters.http.ext_authz": {
-						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
-						"disabled": true
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+						"key": "X-XSS-Protection",
+						"value": "1; mode=block"
 					}
 				}
-			`
-		}
-		str += "}"
+			],
+			"route": {
+				"cluster": "pomerium-control-plane-http"
+			},
+			"typedPerFilterConfig": {
+				"envoy.filters.http.ext_authz": {
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+					"checkSettings": {
+						"contextExtensions": {
+							"internal": "true",
+							"route_id": "0"
+						}
+					}
+				}
+			}
+		}`
 		return str
 	}
 	t.Run("authenticate", func(t *testing.T) {
@@ -82,22 +100,20 @@ func Test_buildPomeriumHTTPRoutes(t *testing.T) {
 			Services:                 "all",
 			AuthenticateURLString:    "https://authenticate.example.com",
 			AuthenticateCallbackPath: "/oauth2/callback",
-			ForwardAuthURLString:     "https://forward-auth.example.com",
 		}
 		routes, err := b.buildPomeriumHTTPRoutes(options, "authenticate.example.com")
 		require.NoError(t, err)
 
 		testutil.AssertProtoJSONEqual(t, `[
-			`+routeString("path", "/.pomerium/jwt", true)+`,
-			`+routeString("path", "/ping", false)+`,
-			`+routeString("path", "/healthz", false)+`,
-			`+routeString("path", "/.pomerium", false)+`,
-			`+routeString("prefix", "/.pomerium/", false)+`,
-			`+routeString("path", "/.well-known/pomerium", false)+`,
-			`+routeString("prefix", "/.well-known/pomerium/", false)+`,
-			`+routeString("path", "/robots.txt", false)+`,
-			`+routeString("path", "/oauth2/callback", false)+`,
-			`+routeString("path", "/", false)+`
+			`+routeString("path", "/ping")+`,
+			`+routeString("path", "/healthz")+`,
+			`+routeString("path", "/.pomerium")+`,
+			`+routeString("prefix", "/.pomerium/")+`,
+			`+routeString("path", "/.well-known/pomerium")+`,
+			`+routeString("prefix", "/.well-known/pomerium/")+`,
+			`+routeString("path", "/oauth2/callback")+`,
+			`+routeString("path", "/")+`,
+			`+routeString("path", "/robots.txt")+`
 		]`, routes)
 	})
 	t.Run("proxy fronting authenticate", func(t *testing.T) {
@@ -110,78 +126,46 @@ func Test_buildPomeriumHTTPRoutes(t *testing.T) {
 		require.NoError(t, err)
 		testutil.AssertProtoJSONEqual(t, "null", routes)
 	})
-
-	t.Run("with robots", func(t *testing.T) {
-		options := &config.Options{
-			Services:                 "all",
-			AuthenticateURLString:    "https://authenticate.example.com",
-			AuthenticateCallbackPath: "/oauth2/callback",
-			ForwardAuthURLString:     "https://forward-auth.example.com",
-			Policies: []config.Policy{{
-				From: "https://from.example.com",
-				To:   mustParseWeightedURLs(t, "https://to.example.com"),
-			}},
-		}
-		_ = options.Policies[0].Validate()
-		routes, err := b.buildPomeriumHTTPRoutes(options, "from.example.com")
-		require.NoError(t, err)
-
-		testutil.AssertProtoJSONEqual(t, `[
-			`+routeString("path", "/.pomerium/jwt", true)+`,
-			`+routeString("path", "/ping", false)+`,
-			`+routeString("path", "/healthz", false)+`,
-			`+routeString("path", "/.pomerium", false)+`,
-			`+routeString("prefix", "/.pomerium/", false)+`,
-			`+routeString("path", "/.well-known/pomerium", false)+`,
-			`+routeString("prefix", "/.well-known/pomerium/", false)+`,
-			`+routeString("path", "/robots.txt", false)+`
-		]`, routes)
-	})
-
-	t.Run("without robots", func(t *testing.T) {
-		options := &config.Options{
-			Services:                 "all",
-			AuthenticateURLString:    "https://authenticate.example.com",
-			AuthenticateCallbackPath: "/oauth2/callback",
-			ForwardAuthURLString:     "https://forward-auth.example.com",
-			Policies: []config.Policy{{
-				From:                             "https://from.example.com",
-				To:                               mustParseWeightedURLs(t, "https://to.example.com"),
-				AllowPublicUnauthenticatedAccess: true,
-			}},
-		}
-		_ = options.Policies[0].Validate()
-		routes, err := b.buildPomeriumHTTPRoutes(options, "from.example.com")
-		require.NoError(t, err)
-
-		testutil.AssertProtoJSONEqual(t, `[
-			`+routeString("path", "/.pomerium/jwt", true)+`,
-			`+routeString("path", "/ping", false)+`,
-			`+routeString("path", "/healthz", false)+`,
-			`+routeString("path", "/.pomerium", false)+`,
-			`+routeString("prefix", "/.pomerium/", false)+`,
-			`+routeString("path", "/.well-known/pomerium", false)+`,
-			`+routeString("prefix", "/.well-known/pomerium/", false)+`
-		]`, routes)
-	})
 }
 
 func Test_buildControlPlanePathRoute(t *testing.T) {
+	options := config.NewDefaultOptions()
 	b := &Builder{filemgr: filemgr.NewManager()}
-	route := b.buildControlPlanePathRoute("/hello/world", false)
+	route := b.buildControlPlanePathRoute(options, "/hello/world")
 	testutil.AssertProtoJSONEqual(t, `
 		{
 			"name": "pomerium-path-/hello/world",
 			"match": {
 				"path": "/hello/world"
 			},
+			"responseHeadersToAdd": [
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+					  "key": "X-Frame-Options",
+					  "value": "SAMEORIGIN"
+					}
+				},
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+					  "key": "X-XSS-Protection",
+					  "value": "1; mode=block"
+					}
+				}
+			],
 			"route": {
 				"cluster": "pomerium-control-plane-http"
 			},
 			"typedPerFilterConfig": {
 				"envoy.filters.http.ext_authz": {
 					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
-					"disabled": true
+					"checkSettings": {
+						"contextExtensions": {
+							"internal": "true",
+							"route_id": "0"
+						}
+					}
 				}
 			}
 		}
@@ -189,21 +173,43 @@ func Test_buildControlPlanePathRoute(t *testing.T) {
 }
 
 func Test_buildControlPlanePrefixRoute(t *testing.T) {
+	options := config.NewDefaultOptions()
 	b := &Builder{filemgr: filemgr.NewManager()}
-	route := b.buildControlPlanePrefixRoute("/hello/world/", false)
+	route := b.buildControlPlanePrefixRoute(options, "/hello/world/")
 	testutil.AssertProtoJSONEqual(t, `
 		{
 			"name": "pomerium-prefix-/hello/world/",
 			"match": {
 				"prefix": "/hello/world/"
 			},
+			"responseHeadersToAdd": [
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+					  "key": "X-Frame-Options",
+					  "value": "SAMEORIGIN"
+					}
+				},
+				{
+					"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+					"header": {
+					  "key": "X-XSS-Protection",
+					  "value": "1; mode=block"
+					}
+				}
+			],
 			"route": {
 				"cluster": "pomerium-control-plane-http"
 			},
 			"typedPerFilterConfig": {
 				"envoy.filters.http.ext_authz": {
 					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
-					"disabled": true
+					"checkSettings": {
+						"contextExtensions": {
+							"internal": "true",
+							"route_id": "0"
+						}
+					}
 				}
 			}
 		}
@@ -242,18 +248,21 @@ func TestTimeouts(t *testing.T) {
 
 	for _, tc := range testCases {
 		b := &Builder{filemgr: filemgr.NewManager()}
-		routes, err := b.buildPolicyRoutes(&config.Options{
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 			CookieName:             "pomerium",
 			DefaultUpstreamTimeout: time.Second * 3,
+			SharedKey:              cryptutil.NewBase64Key(),
 			Policies: []config.Policy{
 				{
-					Source:          &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+					From:            "https://example.com",
+					To:              mustParseWeightedURLs(t, "https://to.example.com"),
 					Path:            "/test",
 					UpstreamTimeout: getDuration(tc.upstream),
 					IdleTimeout:     getDuration(tc.idle),
 					AllowWebsockets: tc.allowWebsockets,
-				}},
-		}, "example.com")
+				},
+			},
+		}}, "example.com")
 		if !assert.NoError(t, err, "%v", tc) || !assert.Len(t, routes, 1, tc) || !assert.NotNil(t, routes[0].GetRoute(), "%v", tc) {
 			continue
 		}
@@ -294,70 +303,103 @@ func Test_buildPolicyRoutes(t *testing.T) {
 	oneMinute := time.Minute
 	ten := time.Second * 10
 
-	b := &Builder{filemgr: filemgr.NewManager()}
-	routes, err := b.buildPolicyRoutes(&config.Options{
+	// note: within each policy below, fields that do not affect the route ID
+	// are grouped separately, after the fields that do affect the route ID.
+	policies := []config.Policy{
+		0: { // skipped by host filter
+			From: "https://ignore.example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+
+			PassIdentityHeaders: ptr(true),
+		},
+		1: {
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+
+			PassIdentityHeaders: ptr(true),
+		},
+		2: {
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+			Path: "/some/path",
+
+			AllowWebsockets:     true,
+			PreserveHostHeader:  true,
+			PassIdentityHeaders: ptr(true),
+		},
+		3: {
+			From:   "https://example.com",
+			To:     mustParseWeightedURLs(t, "https://to.example.com"),
+			Prefix: "/some/prefix/",
+
+			SetRequestHeaders:   map[string]string{"HEADER-KEY": "HEADER-VALUE"},
+			UpstreamTimeout:     &oneMinute,
+			PassIdentityHeaders: ptr(true),
+		},
+		4: {
+			From:  "https://example.com",
+			To:    mustParseWeightedURLs(t, "https://to.example.com"),
+			Regex: `^/[a]+$`,
+
+			PassIdentityHeaders: ptr(true),
+		},
+		5: { // same route ID as 3
+			From:   "https://example.com",
+			To:     mustParseWeightedURLs(t, "https://to.example.com"),
+			Prefix: "/some/prefix/",
+
+			RemoveRequestHeaders: []string{"HEADER-KEY"},
+			UpstreamTimeout:      &oneMinute,
+			PassIdentityHeaders:  ptr(true),
+		},
+		6: { // same route ID as 2
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+			Path: "/some/path",
+
+			AllowSPDY:           true,
+			PreserveHostHeader:  true,
+			PassIdentityHeaders: ptr(true),
+		},
+		7: { // same route ID as 2
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+			Path: "/some/path",
+
+			AllowSPDY:           true,
+			AllowWebsockets:     true,
+			PreserveHostHeader:  true,
+			PassIdentityHeaders: ptr(true),
+		},
+		8: {
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
+			Path: "/websocket-timeout",
+
+			AllowWebsockets:     true,
+			PreserveHostHeader:  true,
+			PassIdentityHeaders: ptr(true),
+			UpstreamTimeout:     &ten,
+		},
+	}
+	routeIDs := []string{
+		1: "772697672458217856",
+		2: "6032229746964560472",
+		3: "13317665674438641304",
+		4: "9768293332770157550",
+		5: "13317665674438641304", // same as 3
+		6: "6032229746964560472",  // same as 2
+		7: "6032229746964560472",  // same as 2
+		8: "1591581179179639728",
+	}
+
+	b := &Builder{filemgr: filemgr.NewManager(), reproxy: reproxy.New()}
+	routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 		CookieName:             "pomerium",
 		DefaultUpstreamTimeout: time.Second * 3,
-		Policies: []config.Policy{
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://ignore.example.com")},
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Path:                "/some/path",
-				AllowWebsockets:     true,
-				PreserveHostHeader:  true,
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Prefix:              "/some/prefix/",
-				SetRequestHeaders:   map[string]string{"HEADER-KEY": "HEADER-VALUE"},
-				UpstreamTimeout:     &oneMinute,
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Regex:               `^/[a]+$`,
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:               &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Prefix:               "/some/prefix/",
-				RemoveRequestHeaders: []string{"HEADER-KEY"},
-				UpstreamTimeout:      &oneMinute,
-				PassIdentityHeaders:  true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Path:                "/some/path",
-				AllowSPDY:           true,
-				PreserveHostHeader:  true,
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Path:                "/some/path",
-				AllowSPDY:           true,
-				AllowWebsockets:     true,
-				PreserveHostHeader:  true,
-				PassIdentityHeaders: true,
-			},
-			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
-				Path:                "/websocket-timeout",
-				AllowWebsockets:     true,
-				PreserveHostHeader:  true,
-				PassIdentityHeaders: true,
-				UpstreamTimeout:     &ten,
-			},
-		},
-	}, "example.com")
+		SharedKey:              cryptutil.NewBase64Key(),
+		Policies:               policies,
+	}}, "example.com")
 	require.NoError(t, err)
 
 	testutil.AssertProtoJSONEqual(t, `
@@ -403,7 +445,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[1]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-2",
@@ -447,7 +516,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[2]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-3",
@@ -487,23 +583,42 @@ func Test_buildPolicyRoutes(t *testing.T) {
 						{ "enabled": false, "upgradeType": "spdy/3.1"}
 					]
 				},
-				"requestHeadersToAdd": [{
-					"append": false,
-					"header": {
-						"key": "HEADER-KEY",
-						"value": "HEADER-VALUE"
-					}
-				}],
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[3]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-4",
 				"match": {
 					"safeRegex": {
-						"googleRe2": {},
 						"regex": "^/[a]+$"
 					}
 				},
@@ -543,7 +658,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[4]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-5",
@@ -587,7 +729,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 					"HEADER-KEY",
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[5]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-6",
@@ -630,7 +799,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[6]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-7",
@@ -674,7 +870,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[7]+`"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-8",
@@ -718,24 +941,53 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "`+routeIDs[8]+`"
+							}
+						}
+					}
+				}
 			}
 		]
 	`, routes)
 
 	t.Run("fronting-authenticate", func(t *testing.T) {
-		routes, err := b.buildPolicyRoutes(&config.Options{
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 			AuthenticateURLString:  "https://authenticate.example.com",
 			Services:               "proxy",
 			CookieName:             "pomerium",
 			DefaultUpstreamTimeout: time.Second * 3,
+			SharedKey:              cryptutil.NewBase64Key(),
 			Policies: []config.Policy{
 				{
-					Source:              &config.StringURL{URL: mustParseURL(t, "https://authenticate.example.com")},
-					PassIdentityHeaders: true,
+					From:                "https://authenticate.example.com",
+					To:                  mustParseWeightedURLs(t, "https://authenticate.internal"),
+					PassIdentityHeaders: ptr(true),
 				},
 			},
-		}, "authenticate.example.com")
+		}}, "authenticate.example.com")
 		require.NoError(t, err)
 
 		testutil.AssertProtoJSONEqual(t, `
@@ -779,6 +1031,22 @@ func Test_buildPolicyRoutes(t *testing.T) {
         	           	"x-pomerium-reproxy-policy",
         	           	"x-pomerium-reproxy-policy-hmac"
 					],
+					"responseHeadersToAdd": [
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-Frame-Options",
+							  "value": "SAMEORIGIN"
+							}
+						},
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-XSS-Protection",
+							  "value": "1; mode=block"
+							}
+						}
+					],
 					"typedPerFilterConfig": {
 						"envoy.filters.http.ext_authz": {
 							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
@@ -791,21 +1059,24 @@ func Test_buildPolicyRoutes(t *testing.T) {
 	})
 
 	t.Run("tcp", func(t *testing.T) {
-		routes, err := b.buildPolicyRoutes(&config.Options{
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 			CookieName:             "pomerium",
 			DefaultUpstreamTimeout: time.Second * 3,
+			SharedKey:              cryptutil.NewBase64Key(),
 			Policies: []config.Policy{
 				{
-					Source:              &config.StringURL{URL: mustParseURL(t, "tcp+https://example.com:22")},
-					PassIdentityHeaders: true,
+					From:                "tcp+https://example.com:22",
+					To:                  mustParseWeightedURLs(t, "tcp://to.example.com"),
+					PassIdentityHeaders: ptr(true),
 				},
 				{
-					Source:              &config.StringURL{URL: mustParseURL(t, "tcp+https://example.com:22")},
-					PassIdentityHeaders: true,
+					From:                "tcp+https://example.com:22",
+					To:                  mustParseWeightedURLs(t, "https://to.example.com"),
+					PassIdentityHeaders: ptr(true),
 					UpstreamTimeout:     &ten,
 				},
 			},
-		}, "example.com:22")
+		}}, "example.com:22")
 		require.NoError(t, err)
 
 		testutil.AssertProtoJSONEqual(t, `
@@ -853,7 +1124,34 @@ func Test_buildPolicyRoutes(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "11959552038839924732"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-1",
@@ -892,33 +1190,155 @@ func Test_buildPolicyRoutes(t *testing.T) {
 					"upgradeConfigs": [
 						{ "enabled": false, "upgradeType": "websocket"},
 						{ "enabled": false, "upgradeType": "spdy/3.1"},
-						{ "enabled": true, "upgradeType": "CONNECT", "connectConfig": {} }
+						{ "enabled": true, "upgradeType": "CONNECT" }
 					]
 				},
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "9444248534316924938"
+							}
+						}
+					}
+				}
+			}
+		]
+	`, routes)
+	})
+
+	t.Run("udp", func(t *testing.T) {
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
+			CookieName:             "pomerium",
+			DefaultUpstreamTimeout: time.Second * 3,
+			SharedKey:              cryptutil.NewBase64Key(),
+			Policies: []config.Policy{
+				{
+					From:                "udp+https://example.com:22",
+					To:                  mustParseWeightedURLs(t, "udp://to.example.com"),
+					PassIdentityHeaders: ptr(true),
+				},
+			},
+		}}, "example.com:22")
+		require.NoError(t, err)
+
+		testutil.AssertProtoJSONEqual(t, `
+		[
+			{
+				"name": "policy-0",
+				"match": {
+					"connectMatcher": {}
+				},
+				"metadata": {
+					"filterMetadata": {
+						"envoy.filters.http.lua": {
+							"remove_impersonate_headers": false,
+							"remove_pomerium_authorization": true,
+							"remove_pomerium_cookie": "pomerium",
+							"rewrite_response_headers": []
+						}
+					}
+				},
+				"route": {
+					"autoHostRewrite": true,
+					"cluster": "policy-12",
+					"hashPolicy": [
+						{
+							"header": {
+								"headerName": "x-pomerium-routing-key"
+							},
+							"terminal": true
+						},
+						{
+							"connectionProperties": {
+								"sourceIp": true
+							},
+							"terminal": true
+						}
+					],
+					"idleTimeout": "0s",
+					"timeout": "0s",
+					"upgradeConfigs": [
+						{ "enabled": false, "upgradeType": "websocket"},
+						{ "enabled": false, "upgradeType": "spdy/3.1"},
+						{ "enabled": true, "upgradeType": "CONNECT-UDP", "connectConfig": {} }
+					]
+				},
+				"requestHeadersToRemove": [
+					"x-pomerium-reproxy-policy",
+					"x-pomerium-reproxy-policy-hmac"
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "8231718688890004616"
+							}
+						}
+					}
+				}
 			}
 		]
 	`, routes)
 	})
 
 	t.Run("remove-pomerium-headers", func(t *testing.T) {
-		routes, err := b.buildPolicyRoutes(&config.Options{
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 			AuthenticateURLString:  "https://authenticate.example.com",
 			Services:               "proxy",
 			CookieName:             "pomerium",
 			DefaultUpstreamTimeout: time.Second * 3,
+			SharedKey:              cryptutil.NewBase64Key(),
 			JWTClaimsHeaders: map[string]string{
 				"x-email": "email",
 			},
 			Policies: []config.Policy{
 				{
-					Source: &config.StringURL{URL: mustParseURL(t, "https://from.example.com")},
+					From: "https://from.example.com",
+					To:   mustParseWeightedURLs(t, "https://to.example.com"),
 				},
 			},
-		}, "from.example.com")
+		}}, "from.example.com")
 		require.NoError(t, err)
 
 		testutil.AssertProtoJSONEqual(t, `
@@ -940,7 +1360,7 @@ func Test_buildPolicyRoutes(t *testing.T) {
 					},
 					"route": {
 						"autoHostRewrite": true,
-						"cluster": "policy-12",
+						"cluster": "policy-13",
 						"hashPolicy": [
 							{
 								"header": {
@@ -967,7 +1387,145 @@ func Test_buildPolicyRoutes(t *testing.T) {
 						"x-email",
 						"x-pomerium-reproxy-policy",
 						"x-pomerium-reproxy-policy-hmac"
-					]
+					],
+					"responseHeadersToAdd": [
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-Frame-Options",
+							  "value": "SAMEORIGIN"
+							}
+						},
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-XSS-Protection",
+							  "value": "1; mode=block"
+							}
+						}
+					],
+					"typedPerFilterConfig": {
+						"envoy.filters.http.ext_authz": {
+							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+							"checkSettings": {
+								"contextExtensions": {
+									"internal": "false",
+									"route_id": "5652544858774142715"
+								}
+							}
+						}
+					}
+				}
+			]
+		`, routes)
+	})
+
+	t.Run("kubernetes", func(t *testing.T) {
+		routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
+			AuthenticateURLString: "https://authenticate.example.com",
+			Services:              "proxy",
+			CookieName:            "pomerium",
+			SharedKey:             cryptutil.NewBase64Key(),
+			Policies: []config.Policy{
+				{
+					From:                          "https://k8s-in.example.com",
+					To:                            mustParseWeightedURLs(t, "https://k8s-out.example.com"),
+					KubernetesServiceAccountToken: "KUBERNETES_SERVICE_ACCOUNT_TOKEN",
+				},
+			},
+		}}, "k8s-in.example.com")
+		require.NoError(t, err)
+
+		testutil.AssertProtoJSONEqual(t, `
+			[
+				{
+					"name": "policy-0",
+					"match": {
+						"prefix": "/"
+					},
+					"metadata": {
+						"filterMetadata": {
+							"envoy.filters.http.lua": {
+								"remove_impersonate_headers": true,
+								"remove_pomerium_authorization": true,
+								"remove_pomerium_cookie": "pomerium",
+								"rewrite_response_headers": []
+							}
+						}
+					},
+					"route": {
+						"autoHostRewrite": true,
+						"cluster": "pomerium-control-plane-http",
+						"hashPolicy": [
+							{
+								"header": {
+									"headerName": "x-pomerium-routing-key"
+								},
+								"terminal": true
+							},
+							{
+								"connectionProperties": {
+									"sourceIp": true
+								},
+								"terminal": true
+							}
+						],
+						"idleTimeout": "0s",
+						"timeout": "0s",
+						"upgradeConfigs": [
+							{ "enabled": true, "upgradeType": "websocket"},
+							{ "enabled": true, "upgradeType": "spdy/3.1"}
+						]
+					},
+					"requestHeadersToAdd": [
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+								"key": "x-pomerium-reproxy-policy",
+								"value": "5799631121007486501"
+							}
+						},
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+								"key": "x-pomerium-reproxy-policy-hmac",
+								"value": "v4w8DAUFdw2qw7RJLUZYBHWndqBOdz5Me6A+1vbDQPY="
+							}
+						}
+					],
+					"requestHeadersToRemove": [
+						"x-pomerium-jwt-assertion",
+						"x-pomerium-jwt-assertion-for",
+						"x-pomerium-reproxy-policy",
+						"x-pomerium-reproxy-policy-hmac"
+					],
+					"responseHeadersToAdd": [
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-Frame-Options",
+							  "value": "SAMEORIGIN"
+							}
+						},
+						{
+							"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+							"header": {
+							  "key": "X-XSS-Protection",
+							  "value": "1; mode=block"
+							}
+						}
+					],
+					"typedPerFilterConfig": {
+						"envoy.filters.http.ext_authz": {
+							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+							"checkSettings": {
+								"contextExtensions": {
+									"internal": "false",
+									"route_id": "5799631121007486501"
+								}
+							}
+						}
+					}
 				}
 			]
 		`, routes)
@@ -980,49 +1538,50 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 	}(getClusterID)
 	getClusterID = policyNameFunc()
 	b := &Builder{filemgr: filemgr.NewManager()}
-	routes, err := b.buildPolicyRoutes(&config.Options{
+	routes, err := b.buildRoutesForPoliciesWithHost(&config.Config{Options: &config.Options{
 		CookieName:             "pomerium",
 		DefaultUpstreamTimeout: time.Second * 3,
+		SharedKey:              cryptutil.NewBase64Key(),
 		Policies: []config.Policy{
 			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                "https://example.com",
 				To:                  mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders: true,
+				PassIdentityHeaders: ptr(true),
 			},
 			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                "https://example.com",
 				To:                  mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders: true,
+				PassIdentityHeaders: ptr(true),
 				PrefixRewrite:       "/foo",
 			},
 			{
-				Source:                   &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                     "https://example.com",
 				To:                       mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders:      true,
+				PassIdentityHeaders:      ptr(true),
 				RegexRewritePattern:      "^/service/([^/]+)(/.*)$",
 				RegexRewriteSubstitution: "\\2/instance/\\1",
 			},
 			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                "https://example.com",
 				To:                  mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders: true,
+				PassIdentityHeaders: ptr(true),
 				HostRewrite:         "literal.example.com",
 			},
 			{
-				Source:              &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                "https://example.com",
 				To:                  mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders: true,
+				PassIdentityHeaders: ptr(true),
 				HostRewriteHeader:   "HOST_HEADER",
 			},
 			{
-				Source:                           &config.StringURL{URL: mustParseURL(t, "https://example.com")},
+				From:                             "https://example.com",
 				To:                               mustParseWeightedURLs(t, "https://foo.example.com/bar"),
-				PassIdentityHeaders:              true,
+				PassIdentityHeaders:              ptr(true),
 				HostPathRegexRewritePattern:      "^/(.+)/.+$",
 				HostPathRegexRewriteSubstitution: "\\1",
 			},
 		},
-	}, "example.com")
+	}}, "example.com")
 	require.NoError(t, err)
 
 	testutil.AssertProtoJSONEqual(t, `
@@ -1069,7 +1628,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-1",
@@ -1113,7 +1699,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-2",
@@ -1134,7 +1747,6 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 					"autoHostRewrite": true,
 					"regexRewrite": {
 						"pattern": {
-							"googleRe2": {},
 							"regex": "^/service/([^/]+)(/.*)$"
 						},
 						"substitution": "\\2/instance/\\1"
@@ -1163,7 +1775,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-3",
@@ -1207,7 +1846,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-4",
@@ -1251,7 +1917,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			},
 			{
 				"name": "policy-5",
@@ -1271,7 +1964,6 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"route": {
 					"hostRewritePathRegex": {
 						"pattern": {
-							"googleRe2": {},
 							"regex": "^/(.+)/.+$"
 						},
 						"substitution": "\\1"
@@ -1301,7 +1993,34 @@ func Test_buildPolicyRoutesRewrite(t *testing.T) {
 				"requestHeadersToRemove": [
 					"x-pomerium-reproxy-policy",
 					"x-pomerium-reproxy-policy-hmac"
-				]
+				],
+				"responseHeadersToAdd": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-Frame-Options",
+						  "value": "SAMEORIGIN"
+						}
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": {
+						  "key": "X-XSS-Protection",
+						  "value": "1; mode=block"
+						}
+					}
+				],
+				"typedPerFilterConfig": {
+					"envoy.filters.http.ext_authz": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+						"checkSettings": {
+							"contextExtensions": {
+								"internal": "false",
+								"route_id": "1410576726089372267"
+							}
+						}
+					}
+				}
 			}
 		]
 	`, routes)
@@ -1382,13 +2101,29 @@ func Test_buildPolicyRouteRedirectAction(t *testing.T) {
 		}, action)
 	})
 	t.Run("ResponseCode", func(t *testing.T) {
-		action, err := b.buildPolicyRouteRedirectAction(&config.PolicyRedirect{
-			ResponseCode: proto.Int32(301),
-		})
-		require.NoError(t, err)
-		assert.Equal(t, &envoy_config_route_v3.RedirectAction{
-			ResponseCode: 301,
-		}, action)
+		codes := []struct {
+			Number *int32
+			Enum   envoy_config_route_v3.RedirectAction_RedirectResponseCode
+		}{
+			{nil, envoy_config_route_v3.RedirectAction_MOVED_PERMANENTLY},
+			{proto.Int32(301), envoy_config_route_v3.RedirectAction_MOVED_PERMANENTLY},
+			{proto.Int32(302), envoy_config_route_v3.RedirectAction_FOUND},
+			{proto.Int32(303), envoy_config_route_v3.RedirectAction_SEE_OTHER},
+			{proto.Int32(307), envoy_config_route_v3.RedirectAction_TEMPORARY_REDIRECT},
+			{proto.Int32(308), envoy_config_route_v3.RedirectAction_PERMANENT_REDIRECT},
+		}
+		for i := range codes {
+			c := &codes[i]
+			t.Run(fmt.Sprint(c.Number), func(t *testing.T) {
+				action, err := b.buildPolicyRouteRedirectAction(&config.PolicyRedirect{
+					ResponseCode: c.Number,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, &envoy_config_route_v3.RedirectAction{
+					ResponseCode: c.Enum,
+				}, action)
+			})
+		}
 	})
 	t.Run("StripQuery", func(t *testing.T) {
 		action, err := b.buildPolicyRouteRedirectAction(&config.PolicyRedirect{
@@ -1415,4 +2150,8 @@ func mustParseURL(t *testing.T, str string) *url.URL {
 	u, err := url.Parse(str)
 	require.NoError(t, err, str)
 	return u
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

@@ -3,6 +3,7 @@
 .*.yaml
 .*.json
 .*.rego
+*.jq
 pem
 env
 coverage.txt
@@ -40,7 +41,6 @@ _testmain.go
 # Without this, the *.[568vq] above ignores this folder.
 !**/graphrbac/1.6
 
-
 .DS_Store
 .idea
 .vscode
@@ -57,7 +57,6 @@ tags
 .idea
 *.ipr
 *.iml
-
 
 # dependencies
 ui/node_modules
@@ -90,8 +89,10 @@ docs/.vuepress/dist/
 .service-accounts
 
 /bazel-*
-internal/envoy/files/envoy-*-?????
-internal/envoy/files/envoy-*-?????.sha256
-internal/envoy/files/envoy-*-?????.version
+pkg/envoy/files/envoy-*-?????
+pkg/envoy/files/envoy-*-?????.sha256
+pkg/envoy/files/envoy-*-?????.version
 
 yarn-error.log
+
+gha-creds-*.json

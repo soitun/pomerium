@@ -20,39 +20,44 @@ jobs:
       tag: ${{ steps.tagName.outputs.tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # pin@v3
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Unshallow
         run: git fetch --prune --unshallow
 
       - name: Set up Node.js
-        uses: actions/setup-node@56337c425554a6be30cdef71bf441f15be286854 # pin@v3
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
           node-version: 16.x
 
       - name: Set up Go
-        uses: actions/setup-go@f6164bd8c8acb4a71fb2791a8b6c4024ff038dab # pin@v2
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed
         with:
-          go-version: 1.17.x
+          go-version: 1.23.x
+          cache: false
 
       - name: Set up Docker
         run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
-      - uses: azure/docker-login@81744f9799e7eaa418697cb168452a2882ae844a # pin@v1
+      - uses: azure/docker-login@15c4aadf093404726ab2ff205b2cdd33fa6d054c
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: google-github-actions/setup-gcloud@877d4953d2c70a0ba7ef3290ae968eb24af233bb # pin@v0
+      - name: gcloud authenticate
+        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f
         with:
-          project_id: pomerium-io
-          service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PRODUCTION_PROJECT_ID }}
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: gcloud sdk
+        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a
 
       - name: Gcloud login
         run: gcloud auth configure-docker
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@b953231f81b8dfd023c58e0854a721e35037f28b # pin@v2
+        uses: goreleaser/goreleaser-action@v6.1.0
         with:
           version: v0.184.0
           args: release --config .github/goreleaser.yaml
@@ -64,8 +69,8 @@ jobs:
         id: tagName
         run: |
           TAG=$(git describe --tags --exact-match)
-          echo ::set-output name=tag::${TAG}
-          echo ::set-output name=version::${TAG#v}
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Install Cloudsmith CLI
         run: |
@@ -84,14 +89,14 @@ jobs:
 
           DEBS="pomerium_${VERSION}-1_amd64.deb pomerium_${VERSION}-1_arm64.deb"
           for pkg in $(echo $DEBS); do
-            cloudsmith push deb pomerium/pomerium/debian/any-version $pkg
+            cloudsmith push deb pomerium/pomerium/any-distro/any-version $pkg
           done
 
       - name: Find latest tag
         id: latestTag
         run: |
           LATEST_TAG=$(git tag | grep -vi 'rc' | sort --version-sort | tail -1)
-          echo "::set-output name=tag::${LATEST_TAG}"
+          echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
 
       - name: Publish latest tag
         if: "steps.latestTag.outputs.tag == steps.tagName.outputs.tag"
@@ -116,18 +121,18 @@ jobs:
     needs: goreleaser
     steps:
       - name: Checkout Gitops Repo
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # pin@v3
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: pomerium/gitops-argocd
           token: ${{ secrets.APPARITOR_GITHUB_TOKEN }}
 
       - name: Bump test environment
-        uses: mikefarah/yq@1425d0720ec16e51172b88c871ac85f56bcd8ae3 # pin@v4.23.1
+        uses: mikefarah/yq@bc5b54cb1d1f720db16c9f75c5b45384d00e5cbf
         with:
           cmd: yq eval '.pomerium.image.tag = "${{ needs.goreleaser.outputs.tag }}"' -i projects/pomerium-demo/pomerium-demo/values.yaml
 
       - name: Commit changes
-        uses: stefanzweifel/git-auto-commit-action@49620cd3ed21ee620a48530e81dba0d139c9cb80 # pin@v4
+        uses: stefanzweifel/git-auto-commit-action@8621497c8c39c72f3e2a999a26b4ca1b5058a842
         with:
           commit_message: |
             Bump test environment pomerium/pomerium

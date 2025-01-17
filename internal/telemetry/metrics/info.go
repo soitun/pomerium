@@ -9,9 +9,7 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/pomerium/pomerium/internal/events"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/metrics"
 )
@@ -277,7 +275,6 @@ func RecordIdentityManagerUserRefresh(ctx context.Context, err error) {
 	if err != nil {
 		counter = identityManagerLastUserRefreshError
 		ts = identityManagerLastUserRefreshErrorTimestamp
-		storeLastErrorEvent(counter.Name(), err)
 	}
 	stats.Record(ctx,
 		ts.M(time.Now().Unix()),
@@ -292,7 +289,6 @@ func RecordIdentityManagerUserGroupRefresh(ctx context.Context, err error) {
 	if err != nil {
 		counter = identityManagerLastUserGroupRefreshError
 		ts = identityManagerLastUserGroupRefreshErrorTimestamp
-		storeLastErrorEvent(counter.Name(), err)
 	}
 	stats.Record(ctx,
 		ts.M(time.Now().Unix()),
@@ -307,7 +303,6 @@ func RecordIdentityManagerSessionRefresh(ctx context.Context, err error) {
 	if err != nil {
 		counter = identityManagerLastSessionRefreshError
 		ts = identityManagerLastSessionRefreshErrorTimestamp
-		storeLastErrorEvent(counter.Name(), err)
 	}
 	stats.Record(ctx,
 		ts.M(time.Now().Unix()),
@@ -315,18 +310,10 @@ func RecordIdentityManagerSessionRefresh(ctx context.Context, err error) {
 	)
 }
 
-func storeLastErrorEvent(id string, err error) {
-	events.Dispatch(&events.LastError{
-		Time:    timestamppb.Now(),
-		Message: err.Error(),
-		Id:      id,
-	})
-}
-
 // SetDBConfigInfo records status, databroker version and error count while parsing
 // the configuration from a databroker
 func SetDBConfigInfo(ctx context.Context, service, configID string, version uint64, errCount int64) {
-	log.Info(ctx).
+	log.Ctx(ctx).Info().
 		Str("service", service).
 		Str("config_id", configID).
 		Uint64("version", version).
@@ -341,7 +328,7 @@ func SetDBConfigInfo(ctx context.Context, service, configID string, version uint
 		},
 		configDBVersion.M(int64(version)),
 	); err != nil {
-		log.Error(ctx).Err(err).Msg("telemetry/metrics: failed to record config version number")
+		log.Ctx(ctx).Error().Err(err).Msg("telemetry/metrics: failed to record config version number")
 	}
 
 	if err := stats.RecordWithTags(
@@ -352,13 +339,13 @@ func SetDBConfigInfo(ctx context.Context, service, configID string, version uint
 		},
 		configDBErrors.M(errCount),
 	); err != nil {
-		log.Error(ctx).Err(err).Msg("telemetry/metrics: failed to record config error count")
+		log.Ctx(ctx).Error().Err(err).Msg("telemetry/metrics: failed to record config error count")
 	}
 }
 
 // SetDBConfigRejected records that a certain databroker config version has been rejected
 func SetDBConfigRejected(ctx context.Context, service, configID string, version uint64, err error) {
-	log.Warn(ctx).Err(err).Msg("databroker: invalid config detected, ignoring")
+	log.Ctx(ctx).Error().Err(err).Msg("databroker: invalid config detected, ignoring")
 	SetDBConfigInfo(ctx, service, configID, version, -1)
 }
 
@@ -374,7 +361,7 @@ func SetConfigInfo(ctx context.Context, service, configName string, checksum uin
 			[]tag.Mutator{serviceTag},
 			configLastReload.M(time.Now().Unix()),
 		); err != nil {
-			log.Error(ctx).Err(err).Msg("telemetry/metrics: failed to record config checksum timestamp")
+			log.Ctx(ctx).Error().Err(err).Msg("telemetry/metrics: failed to record config checksum timestamp")
 		}
 
 		if err := stats.RecordWithTags(
@@ -382,12 +369,12 @@ func SetConfigInfo(ctx context.Context, service, configName string, checksum uin
 			[]tag.Mutator{serviceTag},
 			configLastReloadSuccess.M(1),
 		); err != nil {
-			log.Error(ctx).Err(err).Msg("telemetry/metrics: failed to record config reload")
+			log.Ctx(ctx).Error().Err(err).Msg("telemetry/metrics: failed to record config reload")
 		}
 	} else {
 		stats.Record(context.Background(), configLastReloadSuccess.M(0))
 	}
-	log.Info(ctx).
+	log.Ctx(ctx).Info().
 		Str("service", service).
 		Str("config", configName).
 		Str("checksum", fmt.Sprintf("%x", checksum)).

@@ -45,6 +45,9 @@ func Register(criterionConstructor CriterionConstructor) {
 }
 
 const (
+	// CriterionDataTypeCertificateMatcher indicates the expected data type is
+	// a certificate matcher.
+	CriterionDataTypeCertificateMatcher CriterionDataType = "certificate_matcher"
 	// CriterionDataTypeStringListMatcher indicates the expected data type is a string list matcher.
 	CriterionDataTypeStringListMatcher CriterionDataType = "string_list_matcher"
 	// CriterionDataTypeStringMatcher indicates the expected data type is a string matcher.
@@ -63,9 +66,7 @@ func NewCriterionRule(
 	r1.Body = body
 
 	r2 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTerm(false, failReason),
-		},
+		Head: generator.NewHead("", NewCriterionTerm(false, failReason)),
 		Body: ast.Body{
 			ast.NewExpr(ast.BooleanTerm(true)),
 		},
@@ -87,7 +88,7 @@ func NewCriterionDeviceRule(
 ) *ast.Rule {
 	r1 := g.NewRule(name)
 
-	additionalData := map[string]interface{}{
+	additionalData := map[string]any{
 		"device_type": deviceType,
 	}
 
@@ -104,9 +105,7 @@ func NewCriterionDeviceRule(
 
 	// case 2: rule fails, session exists, device exists
 	r2 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTermWithAdditionalData(false, failReason, additionalData),
-		},
+		Head: generator.NewHead("", NewCriterionTermWithAdditionalData(false, failReason, additionalData)),
 		Body: append(sharedBody, ast.Body{
 			ast.MustParseExpr(`session.id != ""`),
 			ast.MustParseExpr(`device_credential.id != ""`),
@@ -117,9 +116,7 @@ func NewCriterionDeviceRule(
 
 	// case 3: device not authenticated, session exists, device does not exist
 	r3 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTermWithAdditionalData(false, ReasonDeviceUnauthenticated, additionalData),
-		},
+		Head: generator.NewHead("", NewCriterionTermWithAdditionalData(false, ReasonDeviceUnauthenticated, additionalData)),
 		Body: append(sharedBody, ast.Body{
 			ast.MustParseExpr(`session.id != ""`),
 		}...),
@@ -128,9 +125,7 @@ func NewCriterionDeviceRule(
 
 	// case 4: user not authenticated, session does not exist
 	r4 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTermWithAdditionalData(false, ReasonUserUnauthenticated, additionalData),
-		},
+		Head: generator.NewHead("", NewCriterionTermWithAdditionalData(false, ReasonUserUnauthenticated, additionalData)),
 		Body: ast.Body{
 			ast.NewExpr(ast.BooleanTerm(true)),
 		},
@@ -154,9 +149,7 @@ func NewCriterionSessionRule(
 	r1.Body = body
 
 	r2 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTerm(false, failReason),
-		},
+		Head: generator.NewHead("", NewCriterionTerm(false, failReason)),
 		Body: ast.Body{
 			ast.MustParseExpr(`session := get_session(input.session.id)`),
 			ast.MustParseExpr(`session.id != ""`),
@@ -165,9 +158,7 @@ func NewCriterionSessionRule(
 	r1.Else = r2
 
 	r3 := &ast.Rule{
-		Head: &ast.Head{
-			Value: NewCriterionTerm(false, ReasonUserUnauthenticated),
-		},
+		Head: generator.NewHead("", NewCriterionTerm(false, ReasonUserUnauthenticated)),
 		Body: ast.Body{
 			ast.NewExpr(ast.BooleanTerm(true)),
 		},
@@ -179,8 +170,7 @@ func NewCriterionSessionRule(
 
 // NewCriterionTerm creates a new rego term for a criterion:
 //
-//    [true, {"reason"}]
-//
+//	[true, {"reason"}]
 func NewCriterionTerm(value bool, reasons ...Reason) *ast.Term {
 	var terms []*ast.Term
 	for _, r := range reasons {
@@ -194,9 +184,8 @@ func NewCriterionTerm(value bool, reasons ...Reason) *ast.Term {
 
 // NewCriterionTermWithAdditionalData creates a new rego term for a criterion with additional data:
 //
-//    [true, {"reason"}, {"key": "value"}]
-//
-func NewCriterionTermWithAdditionalData(value bool, reason Reason, additionalData map[string]interface{}) *ast.Term {
+//	[true, {"reason"}, {"key": "value"}]
+func NewCriterionTermWithAdditionalData(value bool, reason Reason, additionalData map[string]any) *ast.Term {
 	var kvs [][2]*ast.Term
 	for k, v := range additionalData {
 		kvs = append(kvs, [2]*ast.Term{

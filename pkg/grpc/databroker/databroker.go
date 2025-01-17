@@ -3,17 +3,23 @@ package databroker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
+	"google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/pomerium/pomerium/pkg/grpcutil"
 	"github.com/pomerium/pomerium/pkg/protoutil"
 )
 
-//go:generate go run github.com/golang/mock/mockgen -source=databroker.pb.go -destination ./mock_databroker/databroker.pb.go DataBrokerServiceClient
-//go:generate go run github.com/golang/mock/mockgen -source=leaser.go -destination ./mock_databroker/leaser.go LeaserHandler
+//go:generate go run go.uber.org/mock/mockgen -source=databroker_grpc.pb.go -destination ./mock_databroker/databroker.pb.go DataBrokerServiceClient
+//go:generate go run go.uber.org/mock/mockgen -source=leaser.go -destination ./mock_databroker/leaser.go LeaserHandler
 
 type recordObject interface {
 	proto.Message
@@ -29,6 +35,11 @@ func NewRecord(object recordObject) *Record {
 	}
 }
 
+// IsNotFound returns true if the error is a not found error.
+func IsNotFound(err error) bool {
+	return status.Code(err) == codes.NotFound
+}
+
 // Get gets a record from the databroker and unmarshals it into the object.
 func Get(ctx context.Context, client DataBrokerServiceClient, object recordObject) error {
 	res, err := client.Get(ctx, &GetRequest{
@@ -40,6 +51,34 @@ func Get(ctx context.Context, client DataBrokerServiceClient, object recordObjec
 	}
 
 	return res.GetRecord().GetData().UnmarshalTo(object)
+}
+
+// GetViaJSON gets a record from the databroker, marshals it to JSON, and then unmarshals it to the given type.
+func GetViaJSON[T any](ctx context.Context, client DataBrokerServiceClient, recordType, recordID string) (*T, error) {
+	res, err := client.Get(ctx, &GetRequest{
+		Type: recordType,
+		Id:   recordID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	msg, err := res.GetRecord().GetData().UnmarshalNew()
+	if err != nil {
+		return nil, err
+	}
+
+	bs, err := protojson.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	var obj T
+	err = json.Unmarshal(bs, &obj)
+	if err != nil {
+		return nil, err
+	}
+	return &obj, nil
 }
 
 // Put puts a record into the databroker.
@@ -80,10 +119,10 @@ loop:
 	for {
 		res, err := stream.Recv()
 		switch {
-		case err == io.EOF:
+		case errors.Is(err, io.EOF):
 			break loop
 		case err != nil:
-			return nil, 0, 0, err
+			return nil, 0, 0, fmt.Errorf("error receiving record: %w", err)
 		}
 
 		switch res := res.GetResponse().(type) {
@@ -116,6 +155,36 @@ func (x *PutResponse) GetRecord() *Record {
 		return nil
 	}
 	return records[0]
+}
+
+// GetRecord gets the first record, or nil if there are none.
+func (x *PatchResponse) GetRecord() *Record {
+	records := x.GetRecords()
+	if len(records) == 0 {
+		return nil
+	}
+	return records[0]
+}
+
+// SetFilterByID sets the filter to an id.
+func (x *QueryRequest) SetFilterByID(id string) {
+	x.Filter = &structpb.Struct{Fields: map[string]*structpb.Value{
+		"id": structpb.NewStringValue(id),
+	}}
+}
+
+// SetFilterByIDOrIndex sets the filter to an id or an index.
+func (x *QueryRequest) SetFilterByIDOrIndex(idOrIndex string) {
+	x.Filter = &structpb.Struct{Fields: map[string]*structpb.Value{
+		"$or": structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{
+			structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+				"id": structpb.NewStringValue(idOrIndex),
+			}}),
+			structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+				"$index": structpb.NewStringValue(idOrIndex),
+			}}),
+		}}),
+	}}
 }
 
 // default is 4MB, but we'll do 1MB

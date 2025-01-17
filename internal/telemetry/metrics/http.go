@@ -110,7 +110,7 @@ var (
 )
 
 // HTTPMetricsHandler creates a metrics middleware for incoming HTTP requests
-func HTTPMetricsHandler(getInstallationID func() string, service string) func(next http.Handler) http.Handler {
+func HTTPMetricsHandler(_ func() string, service string) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, tagErr := tag.New(
@@ -120,7 +120,7 @@ func HTTPMetricsHandler(getInstallationID func() string, service string) func(ne
 				tag.Upsert(TagKeyHTTPMethod, r.Method),
 			)
 			if tagErr != nil {
-				log.Warn(ctx).Err(tagErr).Str("context", "HTTPMetricsHandler").Msg("telemetry/metrics: failed to create metrics tag")
+				log.Ctx(ctx).Error().Err(tagErr).Str("context", "HTTPMetricsHandler").Msg("telemetry/metrics: failed to create metrics tag")
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -137,7 +137,7 @@ func HTTPMetricsHandler(getInstallationID func() string, service string) func(ne
 }
 
 // HTTPMetricsRoundTripper creates a metrics tracking tripper for outbound HTTP Requests
-func HTTPMetricsRoundTripper(getInstallationID func() string, service string) func(next http.RoundTripper) http.RoundTripper {
+func HTTPMetricsRoundTripper(_ func() string, service string) func(next http.RoundTripper) http.RoundTripper {
 	return func(next http.RoundTripper) http.RoundTripper {
 		return tripper.RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			ctx, tagErr := tag.New(
@@ -147,7 +147,7 @@ func HTTPMetricsRoundTripper(getInstallationID func() string, service string) fu
 				tag.Upsert(TagKeyHTTPMethod, r.Method),
 			)
 			if tagErr != nil {
-				log.Warn(ctx).Err(tagErr).Str("context", "HTTPMetricsRoundTripper").Msg("telemetry/metrics: failed to create metrics tag")
+				log.Ctx(ctx).Error().Err(tagErr).Str("context", "HTTPMetricsRoundTripper").Msg("telemetry/metrics: failed to create metrics tag")
 				return next.RoundTrip(r)
 			}
 

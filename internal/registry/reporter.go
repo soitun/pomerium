@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/grpc"
 	pb "github.com/pomerium/pomerium/pkg/grpc/registry"
-
-	"github.com/cenkalti/backoff/v4"
 )
 
 // Reporter periodically submits a list of services available on this instance to the service registry
@@ -38,12 +38,12 @@ func (r *Reporter) OnConfigChange(ctx context.Context, cfg *config.Config) {
 
 	services, err := getReportedServices(cfg)
 	if err != nil {
-		log.Warn(ctx).Err(err).Msg("metrics announce to service registry is disabled")
+		log.Ctx(ctx).Error().Err(err).Msg("metrics announce to service registry is disabled")
 	}
 
 	sharedKey, err := cfg.Options.GetSharedKey()
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("decoding shared key")
+		log.Ctx(ctx).Error().Err(err).Msg("decoding shared key")
 		return
 	}
 
@@ -54,12 +54,12 @@ func (r *Reporter) OnConfigChange(ctx context.Context, cfg *config.Config) {
 		SignedJWTKey:   sharedKey,
 	})
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("connecting to registry")
+		log.Ctx(ctx).Error().Err(err).Msg("connecting to registry")
 		return
 	}
 
 	if len(services) > 0 {
-		ctx, cancel := context.WithCancel(context.TODO())
+		ctx, cancel := context.WithCancel(ctx)
 		go runReporter(ctx, pb.NewRegistryClient(registryConn), services)
 		r.cancel = cancel
 	}
@@ -145,7 +145,7 @@ func runReporter(
 			after = resp.CallBackAfter.AsDuration()
 			backoff.Reset()
 		case <-ctx.Done():
-			log.Info(ctx).Msg("service registry reporter stopping")
+			log.Ctx(ctx).Info().Msg("service registry reporter stopping")
 			return
 		}
 	}

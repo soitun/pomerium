@@ -3,27 +3,20 @@ package ui
 
 import (
 	"bytes"
-	"embed"
-	"encoding/json"
-	"fmt"
+	"html/template"
 	"io"
 	"io/fs"
 	"net/http"
-	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/pomerium/csrf"
 )
 
-var (
-	//go:embed dist/*
-	uiFS embed.FS
-)
-
 // ServeFile serves a file.
 func ServeFile(w http.ResponseWriter, r *http.Request, filePath string) error {
-	f, etag, err := openLocalOrEmbeddedFile(filepath.Join("dist", filePath))
+	f, etag, err := openFile(filepath.Join("dist", filePath))
 	if err != nil {
 		return err
 	}
@@ -34,60 +27,70 @@ func ServeFile(w http.ResponseWriter, r *http.Request, filePath string) error {
 	return nil
 }
 
-// ServePage serves the index.html page.
-func ServePage(w http.ResponseWriter, r *http.Request, page string, data map[string]interface{}) error {
+// RenderPage rends the index.html page.
+func RenderPage(page, title string, data map[string]any) ([]byte, error) {
 	if data == nil {
-		data = make(map[string]interface{})
+		data = make(map[string]any)
 	}
-	data["csrfToken"] = csrf.Token(r)
 	data["page"] = page
 
-	jsonData, err := json.Marshal(data)
+	return renderIndex(map[string]any{
+		"Title": title,
+		"Data":  data,
+	})
+}
+
+// ServePage serves the index.html page.
+func ServePage(w http.ResponseWriter, r *http.Request, page, title string, data map[string]any) error {
+	if data == nil {
+		data = make(map[string]any)
+	}
+	data["csrfToken"] = csrf.Token(r)
+
+	bs, err := RenderPage(page, title, data)
 	if err != nil {
 		return err
 	}
 
-	f, _, err := openLocalOrEmbeddedFile("dist/index.html")
-	if err != nil {
-		return err
-	}
-	bs, err := io.ReadAll(f)
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-
-	bs = bytes.Replace(bs,
-		[]byte("window.POMERIUM_DATA = {}"),
-		append([]byte("window.POMERIUM_DATA = "), jsonData...),
-		1)
-
-	http.ServeContent(w, r, "index.html", time.Now(), bytes.NewReader(bs))
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(bs))
 	return nil
 }
 
 var startTime = time.Now()
 
-func openLocalOrEmbeddedFile(name string) (f fs.File, etag string, err error) {
-	f, err = os.Open(filepath.Join("ui", name))
-	if os.IsNotExist(err) {
-		f, err = uiFS.Open(name)
-	}
+func renderIndex(data any) ([]byte, error) {
+	tpl, err := parseIndex()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
-	fi, err := f.Stat()
-	if err != nil {
+	var buf bytes.Buffer
+	err = tpl.Execute(&buf, data)
+	return buf.Bytes(), err
+}
+
+var (
+	parseIndexOnce     sync.Once
+	parseIndexTemplate *template.Template
+	parseIndexError    error
+)
+
+func parseIndex() (*template.Template, error) {
+	parseIndexOnce.Do(func() {
+		var f fs.File
+		f, _, parseIndexError = openFile("dist/index.gohtml")
+		if parseIndexError != nil {
+			return
+		}
+		var bs []byte
+		bs, parseIndexError = io.ReadAll(f)
 		_ = f.Close()
-		return nil, "", err
-	}
+		if parseIndexError != nil {
+			return
+		}
 
-	modTime := fi.ModTime()
-	if modTime.IsZero() {
-		modTime = startTime
-	}
-	etag = fmt.Sprintf("%x", modTime.UnixNano())
-
-	return f, etag, nil
+		parseIndexTemplate, parseIndexError = template.New("").Parse(string(bs))
+	})
+	return parseIndexTemplate, parseIndexError
 }

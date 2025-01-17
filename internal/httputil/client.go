@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -15,8 +14,8 @@ import (
 
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/telemetry/metrics"
-	"github.com/pomerium/pomerium/internal/telemetry/requestid"
 	"github.com/pomerium/pomerium/internal/tripper"
+	"github.com/pomerium/pomerium/pkg/telemetry/requestid"
 )
 
 // ErrTokenRevoked signifies a token revocation or expiration error
@@ -34,7 +33,7 @@ func (l loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	if res != nil {
 		statusCode = res.StatusCode
 	}
-	evt := log.Debug(req.Context()).
+	evt := log.Ctx(req.Context()).Debug().
 		Str("method", req.Method).
 		Str("authority", req.URL.Host).
 		Str("path", req.URL.Path).
@@ -91,7 +90,7 @@ func getDefaultClient() *httpClient {
 }
 
 // Do provides a simple helper interface to make HTTP requests
-func Do(ctx context.Context, method, endpoint, userAgent string, headers map[string]string, params url.Values, response interface{}) error {
+func Do(ctx context.Context, method, endpoint, userAgent string, headers map[string]string, params url.Values, response any) error {
 	var body io.Reader
 	switch method {
 	case http.MethodPost:
@@ -105,7 +104,7 @@ func Do(ctx context.Context, method, endpoint, userAgent string, headers map[str
 			endpoint = u.String()
 		}
 	default:
-		return fmt.Errorf(http.StatusText(http.StatusBadRequest))
+		return errors.New(http.StatusText(http.StatusBadRequest))
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
@@ -139,9 +138,9 @@ func Do(ctx context.Context, method, endpoint, userAgent string, headers map[str
 			if e == nil && response.ErrorDescription == "Token expired or revoked" {
 				return ErrTokenRevoked
 			}
-			return fmt.Errorf(http.StatusText(http.StatusBadRequest))
+			return errors.New(http.StatusText(http.StatusBadRequest))
 		default:
-			return fmt.Errorf(http.StatusText(resp.StatusCode))
+			return errors.New(http.StatusText(resp.StatusCode))
 		}
 	}
 	if response != nil {

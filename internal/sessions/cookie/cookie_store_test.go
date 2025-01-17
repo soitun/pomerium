@@ -4,27 +4,27 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/require"
+
 	"github.com/pomerium/pomerium/internal/encoding"
-	"github.com/pomerium/pomerium/internal/encoding/ecjson"
+	"github.com/pomerium/pomerium/internal/encoding/jws"
 	"github.com/pomerium/pomerium/internal/encoding/mock"
 	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
-
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 func TestNewStore(t *testing.T) {
-	cipher, err := cryptutil.NewAEADCipher(cryptutil.NewKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoder := ecjson.New(cipher)
+	key := cryptutil.NewKey()
+	encoder, err := jws.NewHS256Signer(key)
+	require.NoError(t, err)
 	tests := []struct {
 		name    string
 		opts    *Options
@@ -58,11 +58,9 @@ func TestNewStore(t *testing.T) {
 }
 
 func TestNewCookieLoader(t *testing.T) {
-	cipher, err := cryptutil.NewAEADCipher(cryptutil.NewKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoder := ecjson.New(cipher)
+	key := cryptutil.NewKey()
+	encoder, err := jws.NewHS256Signer(key)
+	require.NoError(t, err)
 	tests := []struct {
 		name    string
 		opts    *Options
@@ -96,10 +94,9 @@ func TestNewCookieLoader(t *testing.T) {
 }
 
 func TestStore_SaveSession(t *testing.T) {
-	c, err := cryptutil.NewAEADCipher(cryptutil.NewKey())
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := cryptutil.NewKey()
+	encoder, err := jws.NewHS256Signer(key)
+	require.NoError(t, err)
 
 	hugeString := make([]byte, 4097)
 	if _, err := rand.Read(hugeString); err != nil {
@@ -107,19 +104,19 @@ func TestStore_SaveSession(t *testing.T) {
 	}
 	tests := []struct {
 		name        string
-		State       interface{}
+		State       any
 		encoder     encoding.Marshaler
 		decoder     encoding.Unmarshaler
 		wantErr     bool
 		wantLoadErr bool
 	}{
-		{"good", &sessions.State{ID: "xyz"}, ecjson.New(c), ecjson.New(c), false, false},
+		{"good", &sessions.State{ID: "xyz"}, encoder, encoder, false, false},
 		{"bad cipher", &sessions.State{ID: "xyz"}, nil, nil, true, true},
-		{"huge cookie", &sessions.State{ID: "xyz", Subject: fmt.Sprintf("%x", hugeString)}, ecjson.New(c), ecjson.New(c), false, false},
-		{"marshal error", &sessions.State{ID: "xyz"}, mock.Encoder{MarshalError: errors.New("error")}, ecjson.New(c), true, true},
-		{"nil encoder cannot save non string type", &sessions.State{ID: "xyz"}, nil, ecjson.New(c), true, true},
-		{"good marshal string directly", cryptutil.NewBase64Key(), nil, ecjson.New(c), false, true},
-		{"good marshal bytes directly", cryptutil.NewKey(), nil, ecjson.New(c), false, true},
+		{"huge cookie", &sessions.State{ID: "xyz", Subject: fmt.Sprintf("%x", hugeString)}, encoder, encoder, false, false},
+		{"marshal error", &sessions.State{ID: "xyz"}, mock.Encoder{MarshalError: errors.New("error")}, encoder, true, true},
+		{"nil encoder cannot save non string type", &sessions.State{ID: "xyz"}, nil, encoder, true, true},
+		{"good marshal string directly", cryptutil.NewBase64Key(), nil, encoder, false, true},
+		{"good marshal bytes directly", cryptutil.NewKey(), nil, encoder, false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -137,25 +134,24 @@ func TestStore_SaveSession(t *testing.T) {
 				decoder: tt.decoder,
 			}
 
-			r := httptest.NewRequest("GET", "/", nil)
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
 			w := httptest.NewRecorder()
 
 			if err := s.SaveSession(w, r, tt.State); (err != nil) != tt.wantErr {
 				t.Errorf("Store.SaveSession() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			r = httptest.NewRequest("GET", "/", nil)
+			r = httptest.NewRequest(http.MethodGet, "/", nil)
 			for _, cookie := range w.Result().Cookies() {
 				r.AddCookie(cookie)
 			}
 
-			enc := ecjson.New(c)
 			jwt, err := s.LoadSession(r)
 			if (err != nil) != tt.wantLoadErr {
 				t.Errorf("LoadSession() error = %v, wantErr %v", err, tt.wantLoadErr)
 				return
 			}
 			var state sessions.State
-			enc.Unmarshal([]byte(jwt), &state)
+			encoder.Unmarshal([]byte(jwt), &state)
 
 			cmpOpts := []cmp.Option{
 				cmpopts.IgnoreUnexported(sessions.State{}),
@@ -169,7 +165,7 @@ func TestStore_SaveSession(t *testing.T) {
 			s.ClearSession(w, r)
 			x := w.Header().Get("Set-Cookie")
 			if !strings.Contains(x, "_pomerium=; Path=/;") {
-				t.Errorf(x)
+				t.Error(x)
 			}
 		})
 	}

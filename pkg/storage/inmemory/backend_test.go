@@ -15,6 +15,7 @@ import (
 
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/storage"
+	"github.com/pomerium/pomerium/pkg/storage/storagetest"
 )
 
 func TestBackend(t *testing.T) {
@@ -72,6 +73,9 @@ func TestBackend(t *testing.T) {
 		assert.Error(t, err)
 		assert.Nil(t, record)
 	})
+	t.Run("patch", func(t *testing.T) {
+		storagetest.TestBackendPatch(t, ctx, backend)
+	})
 }
 
 func TestExpiry(t *testing.T) {
@@ -87,7 +91,7 @@ func TestExpiry(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, backend.serverVersion, sv)
 	}
-	stream, err := backend.Sync(ctx, backend.serverVersion, 0)
+	stream, err := backend.Sync(ctx, "", backend.serverVersion, 0)
 	require.NoError(t, err)
 	var records []*databroker.Record
 	for stream.Next(false) {
@@ -98,7 +102,7 @@ func TestExpiry(t *testing.T) {
 
 	backend.removeChangesBefore(time.Now().Add(time.Second))
 
-	stream, err = backend.Sync(ctx, backend.serverVersion, 0)
+	stream, err = backend.Sync(ctx, "", backend.serverVersion, 0)
 	require.NoError(t, err)
 	records = nil
 	for stream.Next(false) {
@@ -135,7 +139,7 @@ func TestStream(t *testing.T) {
 	backend := New()
 	defer func() { _ = backend.Close() }()
 
-	stream, err := backend.Sync(ctx, backend.serverVersion, 0)
+	stream, err := backend.Sync(ctx, "TYPE", backend.serverVersion, 0)
 	require.NoError(t, err)
 	defer func() { _ = stream.Close() }()
 
@@ -167,7 +171,7 @@ func TestStreamClose(t *testing.T) {
 	ctx := context.Background()
 	t.Run("by backend", func(t *testing.T) {
 		backend := New()
-		stream, err := backend.Sync(ctx, backend.serverVersion, 0)
+		stream, err := backend.Sync(ctx, "", backend.serverVersion, 0)
 		require.NoError(t, err)
 		require.NoError(t, backend.Close())
 		assert.False(t, stream.Next(true))
@@ -175,7 +179,7 @@ func TestStreamClose(t *testing.T) {
 	})
 	t.Run("by stream", func(t *testing.T) {
 		backend := New()
-		stream, err := backend.Sync(ctx, backend.serverVersion, 0)
+		stream, err := backend.Sync(ctx, "", backend.serverVersion, 0)
 		require.NoError(t, err)
 		require.NoError(t, stream.Close())
 		assert.False(t, stream.Next(true))
@@ -184,7 +188,7 @@ func TestStreamClose(t *testing.T) {
 	t.Run("by context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(ctx)
 		backend := New()
-		stream, err := backend.Sync(ctx, backend.serverVersion, 0)
+		stream, err := backend.Sync(ctx, "", backend.serverVersion, 0)
 		require.NoError(t, err)
 		cancel()
 		assert.False(t, stream.Next(true))
@@ -210,7 +214,7 @@ func TestCapacity(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, stream, err := backend.SyncLatest(ctx)
+	_, _, stream, err := backend.SyncLatest(ctx, "EXAMPLE", nil)
 	require.NoError(t, err)
 
 	records, err := storage.RecordStreamToList(stream)
@@ -246,5 +250,19 @@ func TestLease(t *testing.T) {
 		ok, err := backend.Lease(ctx, "test", "b", time.Second*30)
 		require.NoError(t, err)
 		assert.True(t, ok, "expected b to to acquire the lease")
+	}
+}
+
+// Concurrent calls to Put() and ListTypes() should not cause a data race.
+func TestListTypes_concurrent(_ *testing.T) {
+	ctx := context.Background()
+	backend := New()
+	for i := 0; i < 10; i++ {
+		t := fmt.Sprintf("Type-%02d", i)
+		go backend.Put(ctx, []*databroker.Record{{
+			Id:   "1",
+			Type: t,
+		}})
+		go backend.ListTypes(ctx)
 	}
 }

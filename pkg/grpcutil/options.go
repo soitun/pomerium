@@ -3,17 +3,19 @@ package grpcutil
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"time"
 
 	"github.com/go-jose/go-jose/v3"
 	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/pomerium/pomerium/internal/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 // WithStreamSignedJWT returns a StreamClientInterceptor that adds a JWT to requests.
-func WithStreamSignedJWT(key []byte) grpc.StreamClientInterceptor {
+func WithStreamSignedJWT(getKey func() []byte) grpc.StreamClientInterceptor {
 	return func(
 		ctx context.Context,
 		desc *grpc.StreamDesc,
@@ -21,7 +23,7 @@ func WithStreamSignedJWT(key []byte) grpc.StreamClientInterceptor {
 		method string, streamer grpc.Streamer,
 		opts ...grpc.CallOption,
 	) (grpc.ClientStream, error) {
-		ctx, err := withSignedJWT(ctx, key)
+		ctx, err := withSignedJWT(ctx, getKey())
 		if err != nil {
 			return nil, err
 		}
@@ -31,9 +33,9 @@ func WithStreamSignedJWT(key []byte) grpc.StreamClientInterceptor {
 }
 
 // WithUnarySignedJWT returns a UnaryClientInterceptor that adds a JWT to requests.
-func WithUnarySignedJWT(key []byte) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		ctx, err := withSignedJWT(ctx, key)
+func WithUnarySignedJWT(getKey func() []byte) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		ctx, err := withSignedJWT(ctx, getKey())
 		if err != nil {
 			return err
 		}
@@ -65,7 +67,7 @@ func withSignedJWT(ctx context.Context, key []byte) (context.Context, error) {
 // UnaryRequireSignedJWT requires a JWT in the gRPC metadata and that it be signed by the base64-encoded key.
 func UnaryRequireSignedJWT(key string) grpc.UnaryServerInterceptor {
 	keyBS, _ := base64.StdEncoding.DecodeString(key)
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 		if err := RequireSignedJWT(ctx, keyBS); err != nil {
 			return nil, err
 		}
@@ -76,7 +78,7 @@ func UnaryRequireSignedJWT(key string) grpc.UnaryServerInterceptor {
 // StreamRequireSignedJWT requires a JWT in the gRPC metadata and that it be signed by the base64-encoded key.
 func StreamRequireSignedJWT(key string) grpc.StreamServerInterceptor {
 	keyBS, _ := base64.StdEncoding.DecodeString(key)
-	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if err := RequireSignedJWT(ss.Context(), keyBS); err != nil {
 			return err
 		}
@@ -92,22 +94,30 @@ func RequireSignedJWT(ctx context.Context, key []byte) error {
 			return status.Error(codes.Unauthenticated, "unauthenticated")
 		}
 
-		tok, err := jwt.ParseSigned(rawjwt)
-		if err != nil {
-			return status.Errorf(codes.Unauthenticated, "invalid JWT: %v", err)
+		if err := validateJWT(rawjwt, key); err != nil {
+			log.Ctx(ctx).Debug().Err(err).Msg("rejected gRPC request due to invalid JWT")
+			return status.Error(codes.Unauthenticated, "invalid JWT")
 		}
+	}
+	return nil
+}
 
-		var claims struct {
-			Expiry *jwt.NumericDate `json:"exp,omitempty"`
-		}
-		err = tok.Claims(key, &claims)
-		if err != nil {
-			return status.Errorf(codes.Unauthenticated, "invalid JWT: %v", err)
-		}
+func validateJWT(rawjwt string, key []byte) error {
+	tok, err := jwt.ParseSigned(rawjwt)
+	if err != nil {
+		return err
+	}
 
-		if claims.Expiry == nil || time.Now().After(claims.Expiry.Time()) {
-			return status.Errorf(codes.Unauthenticated, "expired JWT: %v", err)
-		}
+	var claims map[string]*jwt.NumericDate
+	err = tok.Claims(key, &claims)
+	if err != nil {
+		return err
+	} else if len(claims) != 1 || claims["exp"] == nil {
+		return fmt.Errorf("expected exactly one claim (exp)")
+	}
+
+	if t := claims["exp"].Time(); time.Now().After(t) {
+		return fmt.Errorf("JWT expired at %s", t.Format(time.DateTime))
 	}
 	return nil
 }

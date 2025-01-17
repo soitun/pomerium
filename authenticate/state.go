@@ -3,32 +3,39 @@ package authenticate
 import (
 	"context"
 	"crypto/cipher"
-	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/url"
-	"sync/atomic"
 
 	"github.com/go-jose/go-jose/v3"
+	"golang.org/x/oauth2"
 
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/authenticateflow"
 	"github.com/pomerium/pomerium/internal/encoding"
-	"github.com/pomerium/pomerium/internal/encoding/ecjson"
 	"github.com/pomerium/pomerium/internal/encoding/jws"
+	"github.com/pomerium/pomerium/internal/handlers"
 	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/internal/sessions/cookie"
-	"github.com/pomerium/pomerium/internal/sessions/header"
 	"github.com/pomerium/pomerium/internal/urlutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
-	"github.com/pomerium/pomerium/pkg/grpc"
-	"github.com/pomerium/pomerium/pkg/grpc/databroker"
-	"github.com/pomerium/pomerium/pkg/grpc/directory"
-	"github.com/pomerium/pomerium/pkg/webauthnutil"
-	"github.com/pomerium/webauthn"
+	"github.com/pomerium/pomerium/pkg/identity"
 )
 
-var outboundGRPCConnection = new(grpc.CachedOutboundGRPClientConn)
+type flow interface {
+	VerifyAuthenticateSignature(r *http.Request) error
+	SignIn(w http.ResponseWriter, r *http.Request, sessionState *sessions.State) error
+	PersistSession(ctx context.Context, w http.ResponseWriter, sessionState *sessions.State, claims identity.SessionClaims, accessToken *oauth2.Token) error
+	VerifySession(ctx context.Context, r *http.Request, sessionState *sessions.State) error
+	RevokeSession(ctx context.Context, r *http.Request, authenticator identity.Authenticator, sessionState *sessions.State) string
+	GetUserInfoData(r *http.Request, sessionState *sessions.State) handlers.UserInfoData
+	LogAuthenticateEvent(r *http.Request)
+	GetIdentityProviderIDForURLValues(url.Values) string
+}
 
 type authenticateState struct {
+	flow flow
+
 	redirectURL *url.URL
 	// sharedEncoder is the encoder to use to serialize data to be consumed
 	// by other services
@@ -41,20 +48,13 @@ type authenticateState struct {
 	cookieSecret []byte
 	// cookieCipher is the cipher to use to encrypt/decrypt session data
 	cookieCipher cipher.AEAD
-	// encryptedEncoder is the encoder used to marshal and unmarshal session data
-	encryptedEncoder encoding.MarshalUnmarshaler
 	// sessionStore is the session store used to persist a user's session
 	sessionStore sessions.SessionStore
 	// sessionLoaders are a collection of session loaders to attempt to pull
 	// a user's session state from
-	sessionLoaders []sessions.SessionLoader
+	sessionLoader sessions.SessionLoader
 
 	jwk *jose.JSONWebKeySet
-
-	dataBrokerClient databroker.DataBrokerServiceClient
-	directoryClient  directory.DirectoryServiceClient
-
-	webauthnRelyingParty *webauthn.RelyingParty
 }
 
 func newAuthenticateState() *authenticateState {
@@ -63,7 +63,10 @@ func newAuthenticateState() *authenticateState {
 	}
 }
 
-func newAuthenticateStateFromConfig(cfg *config.Config) (*authenticateState, error) {
+func newAuthenticateStateFromConfig(
+	ctx context.Context,
+	cfg *config.Config, authenticateConfig *authenticateConfig,
+) (*authenticateState, error) {
 	err := ValidateOptions(cfg.Options)
 	if err != nil {
 		return nil, err
@@ -101,7 +104,7 @@ func newAuthenticateStateFromConfig(cfg *config.Config) (*authenticateState, err
 	}
 
 	// private state encoder setup, used to encrypt oauth2 tokens
-	state.cookieSecret, err = base64.StdEncoding.DecodeString(cfg.Options.CookieSecret)
+	state.cookieSecret, err = cfg.Options.GetCookieSecret()
 	if err != nil {
 		return nil, err
 	}
@@ -111,17 +114,14 @@ func newAuthenticateStateFromConfig(cfg *config.Config) (*authenticateState, err
 		return nil, err
 	}
 
-	state.encryptedEncoder = ecjson.New(state.cookieCipher)
-
-	headerStore := header.NewStore(state.encryptedEncoder)
-
 	cookieStore, err := cookie.NewStore(func() cookie.Options {
 		return cookie.Options{
-			Name:     cfg.Options.CookieName,
+			Name:     cfg.Options.CookieName + "_authenticate",
 			Domain:   cfg.Options.CookieDomain,
-			Secure:   cfg.Options.CookieSecure,
+			Secure:   true,
 			HTTPOnly: cfg.Options.CookieHTTPOnly,
 			Expire:   cfg.Options.CookieExpire,
+			SameSite: cfg.Options.GetCookieSameSite(),
 		}
 	}, state.sharedEncoder)
 	if err != nil {
@@ -129,60 +129,36 @@ func newAuthenticateStateFromConfig(cfg *config.Config) (*authenticateState, err
 	}
 
 	state.sessionStore = cookieStore
-	state.sessionLoaders = []sessions.SessionLoader{headerStore, cookieStore}
+	state.sessionLoader = cookieStore
 	state.jwk = new(jose.JSONWebKeySet)
-	if cfg.Options.SigningKey != "" {
-		decodedCert, err := base64.StdEncoding.DecodeString(cfg.Options.SigningKey)
-		if err != nil {
-			return nil, fmt.Errorf("authenticate: failed to decode signing key: %w", err)
-		}
-		jwk, err := cryptutil.PublicJWKFromBytes(decodedCert)
+	signingKey, err := cfg.Options.GetSigningKey()
+	if err != nil {
+		return nil, err
+	}
+	if len(signingKey) > 0 {
+		ks, err := cryptutil.PublicJWKsFromBytes(signingKey)
 		if err != nil {
 			return nil, fmt.Errorf("authenticate: failed to convert jwks: %w", err)
 		}
-		state.jwk.Keys = append(state.jwk.Keys, *jwk)
+		for _, k := range ks {
+			state.jwk.Keys = append(state.jwk.Keys, *k)
+		}
 	}
 
-	sharedKey, err := cfg.Options.GetSharedKey()
+	if cfg.Options.UseStatelessAuthenticateFlow() {
+		state.flow, err = authenticateflow.NewStateless(ctx,
+			cfg,
+			cookieStore,
+			authenticateConfig.getIdentityProvider,
+			authenticateConfig.profileTrimFn,
+			authenticateConfig.authEventFn,
+		)
+	} else {
+		state.flow, err = authenticateflow.NewStateful(ctx, cfg, cookieStore)
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	dataBrokerConn, err := outboundGRPCConnection.Get(context.Background(), &grpc.OutboundOptions{
-		OutboundPort:   cfg.OutboundPort,
-		InstallationID: cfg.Options.InstallationID,
-		ServiceName:    cfg.Options.Services,
-		SignedJWTKey:   sharedKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	state.dataBrokerClient = databroker.NewDataBrokerServiceClient(dataBrokerConn)
-	state.directoryClient = directory.NewDirectoryServiceClient(dataBrokerConn)
-
-	state.webauthnRelyingParty = webauthn.NewRelyingParty(
-		authenticateURL.String(),
-		webauthnutil.NewCredentialStorage(state.dataBrokerClient),
-	)
 
 	return state, nil
-}
-
-type atomicAuthenticateState struct {
-	atomic.Value
-}
-
-func newAtomicAuthenticateState(state *authenticateState) *atomicAuthenticateState {
-	aas := new(atomicAuthenticateState)
-	aas.Store(state)
-	return aas
-}
-
-func (aas *atomicAuthenticateState) Load() *authenticateState {
-	return aas.Value.Load().(*authenticateState)
-}
-
-func (aas *atomicAuthenticateState) Store(state *authenticateState) {
-	aas.Value.Store(state)
 }

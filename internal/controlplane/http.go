@@ -2,30 +2,34 @@
 package controlplane
 
 import (
+	"fmt"
 	"net/http"
-	"net/http/pprof"
 	"time"
 
 	"github.com/CAFxX/httpcompression"
-	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
+	"github.com/rs/zerolog"
 
-	"github.com/pomerium/pomerium/internal/httputil"
+	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/handlers"
 	"github.com/pomerium/pomerium/internal/log"
+	"github.com/pomerium/pomerium/internal/middleware"
 	"github.com/pomerium/pomerium/internal/telemetry"
-	"github.com/pomerium/pomerium/internal/telemetry/requestid"
+	"github.com/pomerium/pomerium/internal/urlutil"
+	hpke_handlers "github.com/pomerium/pomerium/pkg/hpke/handlers"
+	"github.com/pomerium/pomerium/pkg/telemetry/requestid"
 )
 
-func (srv *Server) addHTTPMiddleware() {
+func (srv *Server) addHTTPMiddleware(root *mux.Router, logger *zerolog.Logger, _ *config.Config) {
 	compressor, err := httpcompression.DefaultAdapter()
 	if err != nil {
 		panic(err)
 	}
 
-	root := srv.HTTPRouter
 	root.Use(compressor)
 	root.Use(srv.reproxy.Middleware)
 	root.Use(requestid.HTTPMiddleware())
-	root.Use(log.NewHandler(log.Logger))
+	root.Use(log.NewHandler(func() *zerolog.Logger { return logger }))
 	root.Use(log.AccessHandler(func(r *http.Request, status, size int, duration time.Duration) {
 		log.FromRequest(r).Debug().
 			Dur("duration", duration).
@@ -36,8 +40,7 @@ func (srv *Server) addHTTPMiddleware() {
 			Str("path", r.URL.String()).
 			Msg("http-request")
 	}))
-	root.Use(handlers.RecoveryHandler())
-	root.Use(log.HeadersHandler(httputil.HeadersXForwarded))
+	root.Use(middleware.Recovery)
 	root.Use(log.RemoteAddrHandler("ip"))
 	root.Use(log.UserAgentHandler("user_agent"))
 	root.Use(log.RefererHandler("referer"))
@@ -45,16 +48,30 @@ func (srv *Server) addHTTPMiddleware() {
 	root.Use(telemetry.HTTPStatsHandler(func() string {
 		return srv.currentConfig.Load().Options.InstallationID
 	}, srv.name))
-	root.HandleFunc("/healthz", httputil.HealthCheck)
-	root.HandleFunc("/ping", httputil.HealthCheck)
+}
 
-	// pprof
-	srv.DebugRouter.Path("/debug/pprof/cmdline").HandlerFunc(pprof.Cmdline)
-	srv.DebugRouter.Path("/debug/pprof/profile").HandlerFunc(pprof.Profile)
-	srv.DebugRouter.Path("/debug/pprof/symbol").HandlerFunc(pprof.Symbol)
-	srv.DebugRouter.Path("/debug/pprof/trace").HandlerFunc(pprof.Trace)
-	srv.DebugRouter.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
+func (srv *Server) mountCommonEndpoints(root *mux.Router, cfg *config.Config) error {
+	authenticateURL, err := cfg.Options.GetAuthenticateURL()
+	if err != nil {
+		return fmt.Errorf("invalid authenticate URL: %w", err)
+	}
 
-	// metrics
-	srv.MetricsRouter.Handle("/metrics", srv.metricsMgr)
+	signingKey, err := cfg.Options.GetSigningKey()
+	if err != nil {
+		return fmt.Errorf("invalid signing key: %w", err)
+	}
+
+	hpkePrivateKey, err := cfg.Options.GetHPKEPrivateKey()
+	if err != nil {
+		return fmt.Errorf("invalid hpke private key: %w", err)
+	}
+	hpkePublicKey := hpkePrivateKey.PublicKey()
+
+	root.HandleFunc("/healthz", handlers.HealthCheck)
+	root.HandleFunc("/ping", handlers.HealthCheck)
+	root.Handle("/.well-known/pomerium", handlers.WellKnownPomerium(authenticateURL))
+	root.Handle("/.well-known/pomerium/", handlers.WellKnownPomerium(authenticateURL))
+	root.Path("/.well-known/pomerium/jwks.json").Methods(http.MethodGet).Handler(handlers.JWKSHandler(signingKey))
+	root.Path(urlutil.HPKEPublicKeyPath).Methods(http.MethodGet).Handler(hpke_handlers.HPKEPublicKeyHandler(hpkePublicKey))
+	return nil
 }

@@ -3,6 +3,7 @@ package databroker
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	backoff "github.com/cenkalti/backoff/v4"
@@ -71,12 +72,24 @@ type Syncer struct {
 	id string
 }
 
-// NewSyncer creates a new Syncer.
-func NewSyncer(id string, handler SyncerHandler, options ...SyncerOption) *Syncer {
-	closeCtx, closeCtxCancel := context.WithCancel(context.Background())
+var DebugUseFasterBackoff atomic.Bool
 
-	bo := backoff.NewExponentialBackOff()
-	bo.MaxElapsedTime = 0
+// NewSyncer creates a new Syncer.
+func NewSyncer(ctx context.Context, id string, handler SyncerHandler, options ...SyncerOption) *Syncer {
+	closeCtx, closeCtxCancel := context.WithCancel(context.WithoutCancel(ctx))
+
+	var bo *backoff.ExponentialBackOff
+	if DebugUseFasterBackoff.Load() {
+		bo = backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(10*time.Millisecond),
+			backoff.WithMultiplier(1.0),
+			backoff.WithMaxElapsedTime(100*time.Millisecond),
+		)
+		bo.MaxElapsedTime = 0
+	} else {
+		bo = backoff.NewExponentialBackOff()
+		bo.MaxElapsedTime = 0
+	}
 	s := &Syncer{
 		cfg:     getSyncerConfig(options...),
 		handler: handler,
@@ -117,10 +130,10 @@ func (syncer *Syncer) Run(ctx context.Context) error {
 		}
 
 		if err != nil {
-			log.Error(ctx).Err(err).Msg("sync")
+			log.Ctx(ctx).Error().Err(err).Msg("sync")
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-time.After(syncer.backoff.NextBackOff()):
 			}
 		}
@@ -128,13 +141,15 @@ func (syncer *Syncer) Run(ctx context.Context) error {
 }
 
 func (syncer *Syncer) init(ctx context.Context) error {
-	log.Info(ctx).Msg("initial sync")
+	log.Ctx(ctx).Debug().Msg("initial sync")
 	records, recordVersion, serverVersion, err := InitialSync(ctx, syncer.handler.GetDataBrokerServiceClient(), &SyncLatestRequest{
 		Type: syncer.cfg.typeURL,
 	})
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("error during initial sync")
-		return err
+		if status.Code(err) == codes.Canceled && ctx.Err() != nil {
+			err = fmt.Errorf("%w: %w", err, context.Cause(ctx))
+		}
+		return fmt.Errorf("error during initial sync: %w", err)
 	}
 	syncer.backoff.Reset()
 
@@ -152,34 +167,31 @@ func (syncer *Syncer) sync(ctx context.Context) error {
 	stream, err := syncer.handler.GetDataBrokerServiceClient().Sync(ctx, &SyncRequest{
 		ServerVersion: syncer.serverVersion,
 		RecordVersion: syncer.recordVersion,
+		Type:          syncer.cfg.typeURL,
 	})
 	if err != nil {
-		log.Error(ctx).Err(err).Msg("error during sync")
-		return err
+		return fmt.Errorf("error calling sync: %w", err)
 	}
 
-	log.Info(ctx).Msg("listening for updates")
+	log.Ctx(ctx).Debug().Msg("listening for updates")
 
 	for {
 		res, err := stream.Recv()
 		if status.Code(err) == codes.Aborted {
-			log.Error(ctx).Err(err).Msg("aborted sync due to mismatched server version")
+			log.Ctx(ctx).Error().Err(err).Msg("aborted sync due to mismatched server version")
 			// server version changed, so re-init
 			syncer.serverVersion = 0
 			return nil
 		} else if err != nil {
-			return err
+			if status.Code(err) == codes.Canceled && ctx.Err() != nil {
+				err = fmt.Errorf("%w: %w", err, context.Cause(ctx))
+			}
+			return fmt.Errorf("error receiving sync record: %w", err)
 		}
 
 		rec := res.GetRecord()
-		log.Debug(logCtxRec(ctx, rec)).Msg("syncer got record")
+		log.Ctx(logCtxRec(ctx, rec)).Debug().Msg("syncer got record")
 
-		if syncer.recordVersion != res.GetRecord().GetVersion()-1 {
-			log.Error(logCtxRec(ctx, rec)).Err(err).
-				Msg("aborted sync due to missing record")
-			syncer.serverVersion = 0
-			return fmt.Errorf("missing record version")
-		}
 		syncer.recordVersion = res.GetRecord().GetVersion()
 		if syncer.cfg.typeURL == "" || syncer.cfg.typeURL == res.GetRecord().GetType() {
 			ctx := logCtxRec(ctx, rec)

@@ -1,37 +1,40 @@
 package proxy
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/gorilla/mux"
 
+	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/handlers"
 	"github.com/pomerium/pomerium/internal/httputil"
 	"github.com/pomerium/pomerium/internal/middleware"
 	"github.com/pomerium/pomerium/internal/urlutil"
-	"github.com/pomerium/pomerium/pkg/cryptutil"
 )
 
 // registerDashboardHandlers returns the proxy service's ServeMux
-func (p *Proxy) registerDashboardHandlers(r *mux.Router) *mux.Router {
+func (p *Proxy) registerDashboardHandlers(r *mux.Router, opts *config.Options) *mux.Router {
 	h := httputil.DashboardSubrouter(r)
 	h.Use(middleware.SetHeaders(httputil.HeadersContentSecurityPolicy))
 
 	// special pomerium endpoints for users to view their session
-	h.Path("/").HandlerFunc(p.userInfo).Methods(http.MethodGet)
+	h.Path("/").Handler(httputil.HandlerFunc(p.userInfo)).Methods(http.MethodGet)
+	h.Path("/device-enrolled").Handler(httputil.HandlerFunc(p.deviceEnrolled))
+	if opts.IsRuntimeFlagSet(config.RuntimeFlagPomeriumJWTEndpoint) {
+		h.Path("/jwt").Handler(httputil.HandlerFunc(p.jwtAssertion)).Methods(http.MethodGet)
+	}
 	h.Path("/sign_out").Handler(httputil.HandlerFunc(p.SignOut)).Methods(http.MethodGet, http.MethodPost)
-	h.Path("/jwt").Handler(httputil.HandlerFunc(p.jwtAssertion)).Methods(http.MethodGet)
+	h.Path("/user").Handler(httputil.HandlerFunc(p.jsonUserInfo)).Methods(http.MethodGet)
+	h.Path("/webauthn").Handler(p.webauthn)
 
 	// called following authenticate auth flow to grab a new or existing session
 	// the route specific cookie is returned in a signed query params
 	c := r.PathPrefix(dashboardPath + "/callback").Subrouter()
-	c.Use(func(h http.Handler) http.Handler {
-		return middleware.ValidateSignature(p.state.Load().sharedKey)(h)
-	})
 	c.Path("/").Handler(httputil.HandlerFunc(p.Callback)).Methods(http.MethodGet)
 
 	// Programmatic API handlers and middleware
@@ -42,13 +45,6 @@ func (p *Proxy) registerDashboardHandlers(r *mux.Router) *mux.Router {
 		Methods(http.MethodGet)
 
 	return r
-}
-
-// RobotsTxt sets the User-Agent header in the response to be "Disallow"
-func (p *Proxy) RobotsTxt(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "User-agent: *\nDisallow: /")
 }
 
 // SignOut clears the local session and redirects the request to the sign out url.
@@ -69,7 +65,9 @@ func (p *Proxy) SignOut(w http.ResponseWriter, r *http.Request) error {
 		redirectURL = uri
 	}
 
-	dashboardURL := *state.authenticateDashboardURL
+	dashboardURL := state.authenticateDashboardURL.ResolveReference(&url.URL{
+		Path: "/.pomerium/sign_out",
+	})
 	q := dashboardURL.Query()
 	if redirectURL != nil {
 		q.Set(urlutil.QueryRedirectURI, redirectURL.String())
@@ -77,79 +75,33 @@ func (p *Proxy) SignOut(w http.ResponseWriter, r *http.Request) error {
 	dashboardURL.RawQuery = q.Encode()
 
 	state.sessionStore.ClearSession(w, r)
-	httputil.Redirect(w, r, urlutil.NewSignedURL(state.sharedKey, &dashboardURL).String(), http.StatusFound)
+	httputil.Redirect(w, r, urlutil.NewSignedURL(state.sharedKey, dashboardURL).String(), http.StatusFound)
 	return nil
 }
 
-func (p *Proxy) userInfo(w http.ResponseWriter, r *http.Request) {
-	state := p.state.Load()
+func (p *Proxy) userInfo(w http.ResponseWriter, r *http.Request) error {
+	data := p.getUserInfoData(r)
+	handlers.UserInfo(data).ServeHTTP(w, r)
+	return nil
+}
 
-	redirectURL := urlutil.GetAbsoluteURL(r).String()
-	if ref := r.Header.Get(httputil.HeaderReferrer); ref != "" {
-		redirectURL = ref
-	}
-
-	uri := state.authenticateDashboardURL.ResolveReference(&url.URL{
-		RawQuery: url.Values{
-			urlutil.QueryRedirectURI: {redirectURL},
-		}.Encode(),
-	})
-	uri = urlutil.NewSignedURL(state.sharedKey, uri).Sign()
-	httputil.Redirect(w, r, uri.String(), http.StatusFound)
+func (p *Proxy) deviceEnrolled(w http.ResponseWriter, r *http.Request) error {
+	data := p.getUserInfoData(r)
+	handlers.DeviceEnrolled(data).ServeHTTP(w, r)
+	return nil
 }
 
 // Callback handles the result of a successful call to the authenticate service
 // and is responsible setting per-route sessions.
 func (p *Proxy) Callback(w http.ResponseWriter, r *http.Request) error {
-	redirectURLString := r.FormValue(urlutil.QueryRedirectURI)
-	encryptedSession := r.FormValue(urlutil.QuerySessionEncrypted)
-
-	redirectURL, err := urlutil.ParseAndValidateURL(redirectURLString)
-	if err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	rawJWT, err := p.saveCallbackSession(w, r, encryptedSession)
-	if err != nil {
-		return httputil.NewError(http.StatusBadRequest, err)
-	}
-
-	// if programmatic, encode the session jwt as a query param
-	if isProgrammatic := r.FormValue(urlutil.QueryIsProgrammatic); isProgrammatic == "true" {
-		q := redirectURL.Query()
-		q.Set(urlutil.QueryPomeriumJWT, string(rawJWT))
-		redirectURL.RawQuery = q.Encode()
-	}
-	httputil.Redirect(w, r, redirectURL.String(), http.StatusFound)
-	return nil
-}
-
-// saveCallbackSession takes an encrypted per-route session token, decrypts
-// it using the shared service key, then stores it the local session store.
-func (p *Proxy) saveCallbackSession(w http.ResponseWriter, r *http.Request, enctoken string) ([]byte, error) {
-	state := p.state.Load()
-
-	// 1. extract the base64 encoded and encrypted JWT from query params
-	encryptedJWT, err := base64.URLEncoding.DecodeString(enctoken)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: malfromed callback token: %w", err)
-	}
-	// 2. decrypt the JWT using the cipher using the _shared_ secret key
-	rawJWT, err := cryptutil.Decrypt(state.sharedCipher, encryptedJWT, nil)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: callback token decrypt error: %w", err)
-	}
-	// 3. Save the decrypted JWT to the session store directly as a string, without resigning
-	if err = state.sessionStore.SaveSession(w, r, rawJWT); err != nil {
-		return nil, fmt.Errorf("proxy: callback session save failure: %w", err)
-	}
-	return rawJWT, nil
+	return p.state.Load().authenticateFlow.Callback(w, r)
 }
 
 // ProgrammaticLogin returns a signed url that can be used to login
 // using the authenticate service.
 func (p *Proxy) ProgrammaticLogin(w http.ResponseWriter, r *http.Request) error {
 	state := p.state.Load()
+	options := p.currentOptions.Load()
 
 	redirectURI, err := urlutil.ParseAndValidateURL(r.FormValue(urlutil.QueryRedirectURI))
 	if err != nil {
@@ -160,30 +112,80 @@ func (p *Proxy) ProgrammaticLogin(w http.ResponseWriter, r *http.Request) error 
 		return httputil.NewError(http.StatusBadRequest, errors.New("invalid redirect uri"))
 	}
 
-	signinURL := *state.authenticateSigninURL
+	idp, err := options.GetIdentityProviderForRequestURL(urlutil.GetAbsoluteURL(r).String())
+	if err != nil {
+		return httputil.NewError(http.StatusInternalServerError, err)
+	}
+
 	callbackURI := urlutil.GetAbsoluteURL(r)
 	callbackURI.Path = dashboardPath + "/callback/"
-	q := signinURL.Query()
+	q := url.Values{}
 	q.Set(urlutil.QueryCallbackURI, callbackURI.String())
-	q.Set(urlutil.QueryRedirectURI, redirectURI.String())
 	q.Set(urlutil.QueryIsProgrammatic, "true")
-	signinURL.RawQuery = q.Encode()
-	response := urlutil.NewSignedURL(state.sharedKey, &signinURL).String()
+
+	rawURL, err := state.authenticateFlow.AuthenticateSignInURL(
+		r.Context(), q, redirectURI, idp.GetId())
+	if err != nil {
+		return httputil.NewError(http.StatusInternalServerError, err)
+	}
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, response)
+	_, _ = io.WriteString(w, rawURL)
 	return nil
 }
 
 // jwtAssertion returns the current request's JWT assertion (rfc7519#section-10.3.1).
 func (p *Proxy) jwtAssertion(w http.ResponseWriter, r *http.Request) error {
-	assertionJWT := r.Header.Get(httputil.HeaderPomeriumJWTAssertion)
-	if assertionJWT == "" {
+	rawAssertionJWT := r.Header.Get(httputil.HeaderPomeriumJWTAssertion)
+	if info := userInfoFromJWT(rawAssertionJWT); info == nil {
 		return httputil.NewError(http.StatusNotFound, errors.New("jwt not found"))
 	}
+
 	w.Header().Set("Content-Type", "application/jwt")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, assertionJWT)
+	_, _ = io.WriteString(w, rawAssertionJWT)
 	return nil
+}
+
+// jsonUserInfo serves the same user info as in the Pomerium JWT, but as a plain JSON object.
+// Note that this is a subset of the full IdP user info from the main HTML user info page.
+func (p *Proxy) jsonUserInfo(w http.ResponseWriter, r *http.Request) error {
+	userInfo := userInfoFromJWT(r.Header.Get(httputil.HeaderPomeriumJWTAssertion))
+	if userInfo == nil {
+		return httputil.NewError(http.StatusNotFound, errors.New("not found"))
+	}
+
+	b, err := json.Marshal(userInfo)
+	if err != nil {
+		return httputil.NewError(http.StatusNotFound, errors.New("not found"))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+	return nil
+}
+
+// userInfoFromJWT extracts user info claims from the Pomerium JWT. Returns nil
+// if the JWT could not be parsed or if it does not contain a subject.
+func userInfoFromJWT(rawJWT string) map[string]any {
+	parsed, err := jwt.ParseSigned(rawJWT)
+	if err != nil {
+		return nil
+	}
+
+	var payload map[string]any
+	if parsed.UnsafeClaimsWithoutVerification(&payload) != nil {
+		return nil
+	} else if sub, ok := payload["sub"].(string); !ok || sub == "" {
+		return nil
+	}
+
+	// Remove claims pertaining to the JWT itself (not the user info).
+	for _, claim := range []string{"iss", "aud", "exp", "iat", "jti"} {
+		delete(payload, claim)
+	}
+
+	return payload
 }

@@ -2,56 +2,135 @@ package authorize
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"net/url"
+	"net/http/httptest"
 	"testing"
 
-	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_service_auth_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
-	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/status"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/pomerium/pomerium/authorize/evaluator"
 	"github.com/pomerium/pomerium/authorize/internal/store"
 	"github.com/pomerium/pomerium/config"
-	"github.com/pomerium/pomerium/internal/encoding/jws"
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	"github.com/pomerium/pomerium/internal/testutil"
-	"github.com/pomerium/pomerium/pkg/grpc/session"
-	"github.com/pomerium/pomerium/pkg/grpc/user"
+	hpke_handlers "github.com/pomerium/pomerium/pkg/hpke/handlers"
+	"github.com/pomerium/pomerium/pkg/policy/criteria"
+	"github.com/pomerium/pomerium/pkg/telemetry/requestid"
 )
+
+func TestAuthorize_handleResult(t *testing.T) {
+	opt := config.NewDefaultOptions()
+	opt.DataBrokerURLString = "https://databroker.example.com"
+	opt.SharedKey = "E8wWIMnihUx+AUfRegAQDNs8eRb3UrB5G3zlJW9XJDM="
+
+	hpkePrivateKey, err := opt.GetHPKEPrivateKey()
+	require.NoError(t, err)
+
+	authnSrv := httptest.NewServer(hpke_handlers.HPKEPublicKeyHandler(hpkePrivateKey.PublicKey()))
+	t.Cleanup(authnSrv.Close)
+	opt.AuthenticateURLString = authnSrv.URL
+
+	a, err := New(context.Background(), &config.Config{Options: opt})
+	require.NoError(t, err)
+
+	t.Run("user-unauthenticated", func(t *testing.T) {
+		res, err := a.handleResult(context.Background(),
+			&envoy_service_auth_v3.CheckRequest{},
+			&evaluator.Request{},
+			&evaluator.Result{
+				Allow: evaluator.NewRuleResult(false, criteria.ReasonUserUnauthenticated),
+			})
+		assert.NoError(t, err)
+		assert.Equal(t, 302, int(res.GetDeniedResponse().GetStatus().GetCode()))
+
+		res, err = a.handleResult(context.Background(),
+			&envoy_service_auth_v3.CheckRequest{},
+			&evaluator.Request{},
+			&evaluator.Result{
+				Deny: evaluator.NewRuleResult(false, criteria.ReasonUserUnauthenticated),
+			})
+		assert.NoError(t, err)
+		assert.Equal(t, 302, int(res.GetDeniedResponse().GetStatus().GetCode()))
+	})
+	t.Run("device-unauthenticated", func(t *testing.T) {
+		res, err := a.handleResult(context.Background(),
+			&envoy_service_auth_v3.CheckRequest{},
+			&evaluator.Request{},
+			&evaluator.Result{
+				Allow: evaluator.NewRuleResult(false, criteria.ReasonDeviceUnauthenticated),
+			})
+		assert.NoError(t, err)
+		assert.Equal(t, 302, int(res.GetDeniedResponse().GetStatus().GetCode()))
+
+		t.Run("webauthn path", func(t *testing.T) {
+			res, err := a.handleResult(context.Background(),
+				&envoy_service_auth_v3.CheckRequest{
+					Attributes: &envoy_service_auth_v3.AttributeContext{
+						Request: &envoy_service_auth_v3.AttributeContext_Request{
+							Http: &envoy_service_auth_v3.AttributeContext_HttpRequest{
+								Path: "/.pomerium/webauthn",
+							},
+						},
+					},
+				},
+				&evaluator.Request{},
+				&evaluator.Result{
+					Allow: evaluator.NewRuleResult(true, criteria.ReasonPomeriumRoute),
+					Deny:  evaluator.NewRuleResult(false, criteria.ReasonDeviceUnauthenticated),
+				})
+			assert.NoError(t, err)
+			assert.NotNil(t, res.GetOkResponse())
+		})
+	})
+	t.Run("invalid-client-certificate", func(t *testing.T) {
+		// Even if the user is unauthenticated, if a client certificate was required and an invalid
+		// certificate was provided, access should be denied (no login redirect).
+		res, err := a.handleResult(context.Background(),
+			&envoy_service_auth_v3.CheckRequest{},
+			&evaluator.Request{},
+			&evaluator.Result{
+				Allow: evaluator.NewRuleResult(false, criteria.ReasonUserUnauthenticated),
+				Deny:  evaluator.NewRuleResult(true, criteria.ReasonInvalidClientCertificate),
+			})
+		assert.NoError(t, err)
+		assert.Equal(t, 495, int(res.GetDeniedResponse().GetStatus().GetCode()))
+	})
+	t.Run("client-certificate-required", func(t *testing.T) {
+		// Likewise, if a client certificate was required and no certificate
+		// was presented, access should be denied (no login redirect).
+		res, err := a.handleResult(context.Background(),
+			&envoy_service_auth_v3.CheckRequest{},
+			&evaluator.Request{},
+			&evaluator.Result{
+				Allow: evaluator.NewRuleResult(false, criteria.ReasonUserUnauthenticated),
+				Deny:  evaluator.NewRuleResult(true, criteria.ReasonClientCertificateRequired),
+			})
+		assert.NoError(t, err)
+		assert.Equal(t, 495, int(res.GetDeniedResponse().GetStatus().GetCode()))
+	})
+}
 
 func TestAuthorize_okResponse(t *testing.T) {
 	opt := &config.Options{
 		AuthenticateURLString: "https://authenticate.example.com",
 		Policies: []config.Policy{{
-			Source: &config.StringURL{URL: &url.URL{Host: "example.com"}},
-			To:     mustParseWeightedURLs(t, "https://to.example.com"),
+			From: "https://example.com",
+			To:   mustParseWeightedURLs(t, "https://to.example.com"),
 			SubPolicies: []config.SubPolicy{{
 				Rego: []string{"allow = true"},
 			}},
 		}},
 		JWTClaimsHeaders: config.NewJWTClaimHeaders("email"),
 	}
-	a := &Authorize{currentOptions: config.NewAtomicOptions(), state: newAtomicAuthorizeState(new(authorizeState))}
-	encoder, _ := jws.NewHS256Signer([]byte{0, 0, 0, 0})
-	a.state.Load().encoder = encoder
+	a := &Authorize{currentOptions: config.NewAtomicOptions(), state: atomicutil.NewValue(new(authorizeState))}
 	a.currentOptions.Store(opt)
-	a.store = store.NewFromProtos(0,
-		&session.Session{
-			Id:     "SESSION_ID",
-			UserId: "USER_ID",
-		},
-		&user.User{
-			Id:    "USER_ID",
-			Name:  "foo",
-			Email: "foo@example.com",
-		},
-	)
-	pe, err := newPolicyEvaluator(opt, a.store)
+	a.store = store.New()
+	pe, err := newPolicyEvaluator(context.Background(), opt, a.store, nil)
 	require.NoError(t, err)
 	a.state.Load().evaluator = pe
 
@@ -102,60 +181,229 @@ func TestAuthorize_okResponse(t *testing.T) {
 }
 
 func TestAuthorize_deniedResponse(t *testing.T) {
-	a := &Authorize{currentOptions: config.NewAtomicOptions(), state: newAtomicAuthorizeState(new(authorizeState))}
-	encoder, _ := jws.NewHS256Signer([]byte{0, 0, 0, 0})
-	a.state.Load().encoder = encoder
+	t.Parallel()
+
+	a := &Authorize{currentOptions: config.NewAtomicOptions(), state: atomicutil.NewValue(new(authorizeState))}
 	a.currentOptions.Store(&config.Options{
 		Policies: []config.Policy{{
-			Source: &config.StringURL{URL: &url.URL{Host: "example.com"}},
+			From: "https://example.com",
 			SubPolicies: []config.SubPolicy{{
 				Rego: []string{"allow = true"},
 			}},
 		}},
 	})
 
-	tests := []struct {
-		name    string
-		in      *envoy_service_auth_v3.CheckRequest
-		code    int32
-		reason  string
-		headers map[string]string
-		want    *envoy_service_auth_v3.CheckResponse
-	}{
-		{
-			"html denied",
-			nil,
-			http.StatusBadRequest,
-			"Access Denied",
-			nil,
-			&envoy_service_auth_v3.CheckResponse{
-				Status: &status.Status{Code: int32(codes.PermissionDenied), Message: "Access Denied"},
-				HttpResponse: &envoy_service_auth_v3.CheckResponse_DeniedResponse{
-					DeniedResponse: &envoy_service_auth_v3.DeniedHttpResponse{
-						Status: &envoy_type_v3.HttpStatus{
-							Code: envoy_type_v3.StatusCode(codes.InvalidArgument),
+	t.Run("json", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		ctx = requestid.WithValue(ctx, "REQUESTID")
+
+		res, err := a.deniedResponse(ctx, &envoy_service_auth_v3.CheckRequest{
+			Attributes: &envoy_service_auth_v3.AttributeContext{
+				Request: &envoy_service_auth_v3.AttributeContext_Request{
+					Http: &envoy_service_auth_v3.AttributeContext_HttpRequest{
+						Headers: map[string]string{
+							"Accept": "application/json",
 						},
-						Headers: []*envoy_config_core_v3.HeaderValueOption{
-							mkHeader("Content-Type", "text/html; charset=UTF-8", false),
-							mkHeader("X-Pomerium-Intercepted-Response", "true", false),
-						},
-						Body: "Access Denied",
 					},
 				},
 			},
-		},
-	}
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := a.deniedResponse(context.TODO(), tc.in, tc.code, tc.reason, tc.headers)
-			require.NoError(t, err)
-			assert.Equal(t, tc.want.Status.Code, got.Status.Code)
-			assert.Equal(t, tc.want.Status.Message, got.Status.Message)
-			testutil.AssertProtoEqual(t, tc.want.GetDeniedResponse().GetHeaders(), got.GetDeniedResponse().GetHeaders())
-		})
-	}
+		}, http.StatusBadRequest, "ERROR", nil)
+		assert.NoError(t, err)
+		testutil.AssertProtoJSONEqual(t, `{
+			"deniedResponse": {
+				"body": "{\"error\":\"ERROR\",\"request_id\":\"REQUESTID\"}",
+				"headers": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "Content-Type", "value": "application/json" }
+					}
+				],
+				"status": {
+					"code": "BadRequest"
+				}
+			},
+			"status": {
+				"code": 7,
+				"message": "Access Denied"
+			}
+		}`, res)
+	})
+
+	t.Run("grpc", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		ctx = requestid.WithValue(ctx, "REQUESTID")
+
+		res, err := a.deniedResponse(ctx, &envoy_service_auth_v3.CheckRequest{
+			Attributes: &envoy_service_auth_v3.AttributeContext{
+				Request: &envoy_service_auth_v3.AttributeContext_Request{
+					Http: &envoy_service_auth_v3.AttributeContext_HttpRequest{
+						Headers: map[string]string{
+							"content-type": "application/grpc+json",
+						},
+					},
+				},
+			},
+		}, http.StatusBadRequest, "ERROR", nil)
+		assert.NoError(t, err)
+		testutil.AssertProtoJSONEqual(t, `{
+			"deniedResponse": {
+				"headers": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "Content-Type", "value": "application/grpc+json" }
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "grpc-message", "value": "ERROR" }
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "grpc-status", "value": "13" }
+					}
+				],
+				"status": {
+					"code": "BadRequest"
+				}
+			},
+			"status": {
+				"code": 7,
+				"message": "Access Denied"
+			}
+		}`, res)
+	})
+
+	t.Run("grpc-web", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		ctx = requestid.WithValue(ctx, "REQUESTID")
+
+		res, err := a.deniedResponse(ctx, &envoy_service_auth_v3.CheckRequest{
+			Attributes: &envoy_service_auth_v3.AttributeContext{
+				Request: &envoy_service_auth_v3.AttributeContext_Request{
+					Http: &envoy_service_auth_v3.AttributeContext_HttpRequest{
+						Headers: map[string]string{
+							"Accept": "application/grpc-web-text",
+						},
+					},
+				},
+			},
+		}, http.StatusBadRequest, "ERROR", nil)
+		assert.NoError(t, err)
+		testutil.AssertProtoJSONEqual(t, `{
+			"deniedResponse": {
+				"headers": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "Content-Type", "value": "application/grpc-web+json" }
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "grpc-message", "value": "ERROR" }
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "grpc-status", "value": "13" }
+					}
+				],
+				"status": {
+					"code": "BadRequest"
+				}
+			},
+			"status": {
+				"code": 7,
+				"message": "Access Denied"
+			}
+		}`, res)
+	})
+
+	t.Run("kubernetes", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		ctx = requestid.WithValue(ctx, "REQUESTID")
+
+		for _, tc := range []struct {
+			code   int32
+			reason string
+
+			expectedMessage    string
+			expectedReason     string
+			expectedStatusCode string
+		}{
+			{401, "Unauthorized", "Unauthorized", "Unauthorized", `"Unauthorized"`},
+			{403, "Forbidden", "Forbidden", "Forbidden", `"Forbidden"`},
+			{404, "Not Found", "Not Found", "NotFound", `"NotFound"`},
+			{400, "Bad Request", "Bad Request", "", `"BadRequest"`},
+			{450, "", "your device fails to meet the requirements necessary to access this page, please contact your administrator for assistance", "Unauthorized", `450`},
+			{495, "", "a valid client certificate is required to access this page", "Unauthorized", `495`},
+			{500, "Internal Server Error", "Internal Server Error", "", `"InternalServerError"`},
+		} {
+			res, err := a.deniedResponse(ctx, &envoy_service_auth_v3.CheckRequest{
+				Attributes: &envoy_service_auth_v3.AttributeContext{
+					Request: &envoy_service_auth_v3.AttributeContext_Request{
+						Http: &envoy_service_auth_v3.AttributeContext_HttpRequest{
+							Headers: map[string]string{
+								"Accept":     "application/json",
+								"User-Agent": "kubectl/vX.Y.Z (linux/amd64) kubernetes/000000",
+							},
+						},
+					},
+				},
+			}, tc.code, tc.reason, nil)
+			assert.NoError(t, err)
+			testutil.AssertProtoJSONEqual(t, fmt.Sprintf(`{
+			"deniedResponse": {
+				"body": "{\"apiVersion\":\"v1\",\"code\":%[1]d,\"kind\":\"Status\",\"message\":\"%[2]s\",\"reason\":\"%[3]s\",\"status\":\"Failure\"}",
+				"headers": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "Content-Type", "value": "application/json" }
+					}
+				],
+				"status": {
+					"code": %[4]s
+				}
+			},
+			"status": {
+				"code": 7,
+				"message": "Access Denied"
+			}
+		}`, tc.code, tc.expectedMessage, tc.expectedReason, tc.expectedStatusCode), res)
+		}
+	})
+
+	t.Run("html", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		ctx = requestid.WithValue(ctx, "REQUESTID")
+
+		res, err := a.deniedResponse(ctx, &envoy_service_auth_v3.CheckRequest{}, http.StatusBadRequest, "ERROR", nil)
+		assert.NoError(t, err)
+		assert.Contains(t, res.GetDeniedResponse().GetBody(), "<!DOCTYPE html>")
+		res.HttpResponse.(*envoy_service_auth_v3.CheckResponse_DeniedResponse).DeniedResponse.Body = ""
+		testutil.AssertProtoJSONEqual(t, `{
+			"deniedResponse": {
+				"headers": [
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "Content-Type", "value": "text/html; charset=UTF-8" }
+					},
+					{
+						"appendAction": "OVERWRITE_IF_EXISTS_OR_ADD",
+						"header": { "key": "X-Pomerium-Intercepted-Response", "value": "true" }
+					}
+				],
+				"status": {
+					"code": "BadRequest"
+				}
+			},
+			"status": {
+				"code": 7,
+				"message": "Access Denied"
+			}
+		}`, res)
+	})
 }
 
 func mustParseWeightedURLs(t *testing.T, urls ...string) []config.WeightedURL {
@@ -165,18 +413,27 @@ func mustParseWeightedURLs(t *testing.T, urls ...string) []config.WeightedURL {
 }
 
 func TestRequireLogin(t *testing.T) {
+	t.Parallel()
+
 	opt := config.NewDefaultOptions()
-	opt.AuthenticateURLString = "https://authenticate.example.com"
 	opt.DataBrokerURLString = "https://databroker.example.com"
 	opt.SharedKey = "E8wWIMnihUx+AUfRegAQDNs8eRb3UrB5G3zlJW9XJDM="
-	a, err := New(&config.Config{Options: opt})
+	opt.SigningKey = "LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSUJlMFRxbXJkSXBZWE03c3pSRERWYndXOS83RWJHVWhTdFFJalhsVHNXM1BvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFb0xaRDI2bEdYREhRQmhhZkdlbEVmRDdlNmYzaURjWVJPVjdUbFlIdHF1Y1BFL2hId2dmYQpNY3FBUEZsRmpueUpySXJhYTFlQ2xZRTJ6UktTQk5kNXBRPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo="
+
+	hpkePrivateKey, err := opt.GetHPKEPrivateKey()
+	require.NoError(t, err)
+
+	authnSrv := httptest.NewServer(hpke_handlers.HPKEPublicKeyHandler(hpkePrivateKey.PublicKey()))
+	t.Cleanup(authnSrv.Close)
+	opt.AuthenticateURLString = authnSrv.URL
+
+	a, err := New(context.Background(), &config.Config{Options: opt})
 	require.NoError(t, err)
 
 	t.Run("accept empty", func(t *testing.T) {
 		res, err := a.requireLoginResponse(context.Background(),
 			&envoy_service_auth_v3.CheckRequest{},
-			&evaluator.Request{},
-			false)
+			&evaluator.Request{})
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusFound, int(res.GetDeniedResponse().GetStatus().GetCode()))
 	})
@@ -193,8 +450,7 @@ func TestRequireLogin(t *testing.T) {
 					},
 				},
 			},
-			&evaluator.Request{},
-			false)
+			&evaluator.Request{})
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusFound, int(res.GetDeniedResponse().GetStatus().GetCode()))
 	})
@@ -211,8 +467,7 @@ func TestRequireLogin(t *testing.T) {
 					},
 				},
 			},
-			&evaluator.Request{},
-			false)
+			&evaluator.Request{})
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusUnauthorized, int(res.GetDeniedResponse().GetStatus().GetCode()))
 	})

@@ -10,8 +10,7 @@ import (
 	"github.com/pomerium/pomerium/internal/log"
 )
 
-type healthCheckSrv struct {
-}
+type healthCheckSrv struct{}
 
 // NewHealthCheckServer returns a basic health checker
 func NewHealthCheckServer() grpc_health.HealthServer {
@@ -21,7 +20,7 @@ func NewHealthCheckServer() grpc_health.HealthServer {
 // Check confirms service is reachable, and assumes any service is operational
 // an outlier detection should be used to detect runtime malfunction based on consequitive 5xx
 func (h *healthCheckSrv) Check(ctx context.Context, req *grpc_health.HealthCheckRequest) (*grpc_health.HealthCheckResponse, error) {
-	log.Debug(ctx).Str("service", req.Service).Msg("health check")
+	log.Ctx(ctx).Debug().Str("service", req.Service).Msg("health check")
 	return &grpc_health.HealthCheckResponse{
 		Status: grpc_health.HealthCheckResponse_SERVING,
 	}, nil
@@ -29,6 +28,6 @@ func (h *healthCheckSrv) Check(ctx context.Context, req *grpc_health.HealthCheck
 
 // Watch is not implemented as is not used by Envoy
 func (h *healthCheckSrv) Watch(req *grpc_health.HealthCheckRequest, _ grpc_health.Health_WatchServer) error {
-	log.Error(context.Background()).Str("service", req.Service).Msg("health check watch")
+	log.Error().Str("service", req.Service).Msg("health check watch")
 	return status.Errorf(codes.Unimplemented, "method Watch not implemented")
 }

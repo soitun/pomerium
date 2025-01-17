@@ -1,15 +1,12 @@
 package events
 
 import (
-	"context"
 	"sync"
 
 	"github.com/google/uuid"
 
 	"github.com/pomerium/pomerium/internal/log"
 )
-
-var defaultManager = New()
 
 // A Manager manages the dispatching of events to event sinks.
 type Manager struct {
@@ -27,21 +24,31 @@ func New() *Manager {
 // Dispatch dispatches an event to any registered event sinks.
 func (mgr *Manager) Dispatch(evt Event) {
 	mgr.mu.RLock()
+	dropped := mgr.dispatchLocked(evt)
+	mgr.mu.RUnlock()
+
+	if dropped {
+		log.Error().
+			Interface("event", evt).
+			Msg("controlplane: dropping event due to full channel")
+	}
+}
+
+func (mgr *Manager) dispatchLocked(evt Event) bool {
 	sinks := make([]chan Event, 0, len(mgr.sinks))
 	for _, sink := range mgr.sinks {
 		sinks = append(sinks, sink)
 	}
-	mgr.mu.RUnlock()
 
+	dropped := false
 	for _, sink := range sinks {
 		select {
 		case sink <- evt:
 		default:
-			log.Warn(context.Background()).
-				Interface("event", evt).
-				Msg("controlplane: dropping event due to full channel")
+			dropped = true
 		}
 	}
+	return dropped
 }
 
 // Register registers an event sink to receive events.

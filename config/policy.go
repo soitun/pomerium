@@ -1,65 +1,69 @@
 package config
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/pomerium/pomerium/internal/hashutil"
-	"github.com/pomerium/pomerium/internal/identity"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/internal/urlutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	configpb "github.com/pomerium/pomerium/pkg/grpc/config"
+	"github.com/pomerium/pomerium/pkg/identity"
 )
 
 // Policy contains route specific configuration and access settings.
 type Policy struct {
+	ID          string `mapstructure:"-" yaml:"-" json:"-"`
+	Name        string `mapstructure:"-" yaml:"-" json:"-"`
+	Description string `mapstructure:"description" yaml:"description,omitempty" json:"description,omitempty"`
+	LogoURL     string `mapstructure:"logo_url" yaml:"logo_url,omitempty" json:"logo_url,omitempty"`
+
 	From string       `mapstructure:"from" yaml:"from"`
 	To   WeightedURLs `mapstructure:"to" yaml:"to"`
+	// Redirect is used for a redirect action instead of `To`
+	Redirect *PolicyRedirect `mapstructure:"redirect" yaml:"redirect"`
+	Response *DirectResponse `mapstructure:"response" yaml:"response,omitempty" json:"response,omitempty"`
 
 	// LbWeights are optional load balancing weights applied to endpoints specified in To
 	// this field exists for compatibility with mapstructure
 	LbWeights []uint32 `mapstructure:"_to_weights,omitempty" json:"-" yaml:"-"`
 
-	// Redirect is used for a redirect action instead of `To`
-	Redirect *PolicyRedirect `mapstructure:"redirect" yaml:"redirect"`
-
 	// Identity related policy
 	AllowedUsers     []string                 `mapstructure:"allowed_users" yaml:"allowed_users,omitempty" json:"allowed_users,omitempty"`
-	AllowedGroups    []string                 `mapstructure:"allowed_groups" yaml:"allowed_groups,omitempty" json:"allowed_groups,omitempty"`
 	AllowedDomains   []string                 `mapstructure:"allowed_domains" yaml:"allowed_domains,omitempty" json:"allowed_domains,omitempty"`
 	AllowedIDPClaims identity.FlattenedClaims `mapstructure:"allowed_idp_claims" yaml:"allowed_idp_claims,omitempty" json:"allowed_idp_claims,omitempty"`
 
-	Source *StringURL `yaml:",omitempty" json:"source,omitempty" hash:"ignore"`
-
 	// Additional route matching options
-	Prefix        string `mapstructure:"prefix" yaml:"prefix,omitempty" json:"prefix,omitempty"`
-	Path          string `mapstructure:"path" yaml:"path,omitempty" json:"path,omitempty"`
-	Regex         string `mapstructure:"regex" yaml:"regex,omitempty" json:"regex,omitempty"`
-	compiledRegex *regexp.Regexp
+	Prefix             string `mapstructure:"prefix" yaml:"prefix,omitempty" json:"prefix,omitempty"`
+	Path               string `mapstructure:"path" yaml:"path,omitempty" json:"path,omitempty"`
+	Regex              string `mapstructure:"regex" yaml:"regex,omitempty" json:"regex,omitempty"`
+	RegexPriorityOrder *int64 `mapstructure:"regex_priority_order" yaml:"regex_priority_order,omitempty" json:"regex_priority_order,omitempty"`
+	compiledRegex      *regexp.Regexp
 
 	// Path Rewrite Options
 	PrefixRewrite            string `mapstructure:"prefix_rewrite" yaml:"prefix_rewrite,omitempty" json:"prefix_rewrite,omitempty"`
 	RegexRewritePattern      string `mapstructure:"regex_rewrite_pattern" yaml:"regex_rewrite_pattern,omitempty" json:"regex_rewrite_pattern,omitempty"`
-	RegexRewriteSubstitution string `mapstructure:"regex_rewrite_substitution" yaml:"regex_rewrite_substitution,omitempty" json:"regex_rewrite_substitution,omitempty"` //nolint
+	RegexRewriteSubstitution string `mapstructure:"regex_rewrite_substitution" yaml:"regex_rewrite_substitution,omitempty" json:"regex_rewrite_substitution,omitempty"`
 
 	// Host Rewrite Options
 	HostRewrite                      string `mapstructure:"host_rewrite" yaml:"host_rewrite,omitempty" json:"host_rewrite,omitempty"`
 	HostRewriteHeader                string `mapstructure:"host_rewrite_header" yaml:"host_rewrite_header,omitempty" json:"host_rewrite_header,omitempty"`
-	HostPathRegexRewritePattern      string `mapstructure:"host_path_regex_rewrite_pattern" yaml:"host_path_regex_rewrite_pattern,omitempty" json:"host_path_regex_rewrite_pattern,omitempty"`                //nolint
-	HostPathRegexRewriteSubstitution string `mapstructure:"host_path_regex_rewrite_substitution" yaml:"host_path_regex_rewrite_substitution,omitempty" json:"host_path_regex_rewrite_substitution,omitempty"` //nolint
+	HostPathRegexRewritePattern      string `mapstructure:"host_path_regex_rewrite_pattern" yaml:"host_path_regex_rewrite_pattern,omitempty" json:"host_path_regex_rewrite_pattern,omitempty"`
+	HostPathRegexRewriteSubstitution string `mapstructure:"host_path_regex_rewrite_substitution" yaml:"host_path_regex_rewrite_substitution,omitempty" json:"host_path_regex_rewrite_substitution,omitempty"`
 
 	// Allow unauthenticated HTTP OPTIONS requests as per the CORS spec
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#Preflighted_requests
@@ -120,9 +124,8 @@ type Policy struct {
 	TLSDownstreamClientCA     string `mapstructure:"tls_downstream_client_ca" yaml:"tls_downstream_client_ca,omitempty"`
 	TLSDownstreamClientCAFile string `mapstructure:"tls_downstream_client_ca_file" yaml:"tls_downstream_client_ca_file,omitempty"`
 
-	// SetAuthorizationHeader sets the authorization request header based on the user's identity. Supported modes are
-	// `pass_through`, `access_token` and `id_token`.
-	SetAuthorizationHeader string `mapstructure:"set_authorization_header" yaml:"set_authorization_header,omitempty"`
+	// TLSUpstreamAllowRenegotiation allows server-initiated TLS renegotiation.
+	TLSUpstreamAllowRenegotiation bool `mapstructure:"tls_upstream_allow_renegotiation" yaml:"allow_renegotiation,omitempty"`
 
 	// SetRequestHeaders adds a collection of headers to the upstream request
 	// in the form of key value pairs. Note bene, this will overwrite the
@@ -143,12 +146,12 @@ type Policy struct {
 	PreserveHostHeader bool `mapstructure:"preserve_host_header" yaml:"preserve_host_header,omitempty"`
 
 	// PassIdentityHeaders controls whether to add a user's identity headers to the upstream request.
-	// These includes:
+	// These include:
 	//
 	//  - X-Pomerium-Jwt-Assertion
 	//  - X-Pomerium-Claim-*
 	//
-	PassIdentityHeaders bool `mapstructure:"pass_identity_headers" yaml:"pass_identity_headers,omitempty"`
+	PassIdentityHeaders *bool `mapstructure:"pass_identity_headers" yaml:"pass_identity_headers,omitempty"`
 
 	// KubernetesServiceAccountToken is the kubernetes token to use for upstream requests.
 	KubernetesServiceAccountToken string `mapstructure:"kubernetes_service_account_token" yaml:"kubernetes_service_account_token,omitempty"`
@@ -157,14 +160,24 @@ type Policy struct {
 
 	// EnableGoogleCloudServerlessAuthentication adds "Authorization: Bearer ID_TOKEN" headers
 	// to upstream requests.
-	EnableGoogleCloudServerlessAuthentication bool `mapstructure:"enable_google_cloud_serverless_authentication" yaml:"enable_google_cloud_serverless_authentication,omitempty"` //nolint
+	EnableGoogleCloudServerlessAuthentication bool `mapstructure:"enable_google_cloud_serverless_authentication" yaml:"enable_google_cloud_serverless_authentication,omitempty"`
+
+	// JWTIssuerFormat controls the format of the 'iss' claim in JWTs passed to upstream services by this route.
+	// Possible values:
+	// - "hostOnly" (default): Issuer strings will be the hostname of the route, with no scheme or trailing slash.
+	// - "uri": Issuer strings will be a complete URI, including the scheme and ending with a trailing slash.
+	JWTIssuerFormat string `mapstructure:"jwt_issuer_format" yaml:"jwt_issuer_format,omitempty"`
+
+	// Allowlist of group names/IDs to include in the Pomerium JWT.
+	// This expands on any global allowlist set in the main Options.
+	JWTGroupsFilter JWTGroupsFilter
 
 	SubPolicies []SubPolicy `mapstructure:"sub_policies" yaml:"sub_policies,omitempty" json:"sub_policies,omitempty"`
 
 	EnvoyOpts *envoy_config_cluster_v3.Cluster `mapstructure:"_envoy_opts" yaml:"-" json:"-"`
 
 	// RewriteResponseHeaders rewrites response headers. This can be used to change the Location header.
-	RewriteResponseHeaders []RewriteHeader `mapstructure:"rewrite_response_headers" yaml:"rewrite_response_headers,omitempty" json:"rewrite_response_headers,omitempty"` //nolint
+	RewriteResponseHeaders []RewriteHeader `mapstructure:"rewrite_response_headers" yaml:"rewrite_response_headers,omitempty" json:"rewrite_response_headers,omitempty"`
 
 	// SetResponseHeaders sets response headers.
 	SetResponseHeaders map[string]string `mapstructure:"set_response_headers" yaml:"set_response_headers,omitempty"`
@@ -173,6 +186,9 @@ type Policy struct {
 	IDPClientID string `mapstructure:"idp_client_id" yaml:"idp_client_id,omitempty"`
 	// IDPClientSecret is the client secret used for the identity provider.
 	IDPClientSecret string `mapstructure:"idp_client_secret" yaml:"idp_client_secret,omitempty"`
+
+	// ShowErrorDetails indicates whether or not additional error details should be displayed.
+	ShowErrorDetails bool `mapstructure:"show_error_details" yaml:"show_error_details" json:"show_error_details"`
 
 	Policy *PPLPolicy `mapstructure:"policy" yaml:"policy,omitempty" json:"policy,omitempty"`
 }
@@ -189,10 +205,15 @@ type SubPolicy struct {
 	ID               string                   `mapstructure:"id" yaml:"id" json:"id"`
 	Name             string                   `mapstructure:"name" yaml:"name" json:"name"`
 	AllowedUsers     []string                 `mapstructure:"allowed_users" yaml:"allowed_users,omitempty" json:"allowed_users,omitempty"`
-	AllowedGroups    []string                 `mapstructure:"allowed_groups" yaml:"allowed_groups,omitempty" json:"allowed_groups,omitempty"`
 	AllowedDomains   []string                 `mapstructure:"allowed_domains" yaml:"allowed_domains,omitempty" json:"allowed_domains,omitempty"`
 	AllowedIDPClaims identity.FlattenedClaims `mapstructure:"allowed_idp_claims" yaml:"allowed_idp_claims,omitempty" json:"allowed_idp_claims,omitempty"`
 	Rego             []string                 `mapstructure:"rego" yaml:"rego" json:"rego,omitempty"`
+	SourcePPL        string                   `mapstructure:"source_ppl" yaml:"source_ppl,omitempty" json:"source_ppl,omitempty"`
+
+	// Explanation is the explanation for why a policy failed.
+	Explanation string `mapstructure:"explanation" yaml:"explanation" json:"explanation,omitempty"`
+	// Remediation are the steps a user needs to take to gain access.
+	Remediation string `mapstructure:"remediation" yaml:"remediation" json:"remediation,omitempty"`
 }
 
 // PolicyRedirect is a route redirect action.
@@ -205,6 +226,44 @@ type PolicyRedirect struct {
 	PrefixRewrite  *string `mapstructure:"prefix_rewrite" yaml:"prefix_rewrite,omitempty" json:"prefix_rewrite,omitempty"`
 	ResponseCode   *int32  `mapstructure:"response_code" yaml:"response_code,omitempty" json:"response_code,omitempty"`
 	StripQuery     *bool   `mapstructure:"strip_query" yaml:"strip_query,omitempty" json:"strip_query,omitempty"`
+}
+
+func (r *PolicyRedirect) validate() error {
+	if r == nil {
+		return nil
+	}
+
+	if _, err := r.GetEnvoyResponseCode(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetEnvoyResponseCode returns the ResponseCode as the corresponding Envoy enum value.
+func (r *PolicyRedirect) GetEnvoyResponseCode() (envoy_config_route_v3.RedirectAction_RedirectResponseCode, error) {
+	if r == nil || r.ResponseCode == nil {
+		return envoy_config_route_v3.RedirectAction_RedirectResponseCode(0), nil
+	}
+	switch code := *r.ResponseCode; code {
+	case http.StatusMovedPermanently:
+		return envoy_config_route_v3.RedirectAction_MOVED_PERMANENTLY, nil
+	case http.StatusFound:
+		return envoy_config_route_v3.RedirectAction_FOUND, nil
+	case http.StatusSeeOther:
+		return envoy_config_route_v3.RedirectAction_SEE_OTHER, nil
+	case http.StatusTemporaryRedirect:
+		return envoy_config_route_v3.RedirectAction_TEMPORARY_REDIRECT, nil
+	case http.StatusPermanentRedirect:
+		return envoy_config_route_v3.RedirectAction_PERMANENT_REDIRECT, nil
+	default:
+		return 0, fmt.Errorf("unsupported redirect response code %d (supported values: 301, 302, 303, 307, 308)", code)
+	}
+}
+
+// A DirectResponse is the response to an HTTP request.
+type DirectResponse struct {
+	Status int    `mapstructure:"status" yaml:"status,omitempty" json:"status,omitempty"`
+	Body   string `mapstructure:"body" yaml:"body,omitempty" json:"body,omitempty"`
 }
 
 // NewPolicyFromProto creates a new Policy from a protobuf policy config route.
@@ -221,52 +280,58 @@ func NewPolicyFromProto(pb *configpb.Route) (*Policy, error) {
 	}
 
 	p := &Policy{
-		From:                             pb.GetFrom(),
-		AllowedUsers:                     pb.GetAllowedUsers(),
-		AllowedGroups:                    pb.GetAllowedGroups(),
+		AllowAnyAuthenticatedUser:        pb.GetAllowAnyAuthenticatedUser(),
 		AllowedDomains:                   pb.GetAllowedDomains(),
 		AllowedIDPClaims:                 identity.NewFlattenedClaimsFromPB(pb.GetAllowedIdpClaims()),
-		Prefix:                           pb.GetPrefix(),
-		Path:                             pb.GetPath(),
-		Regex:                            pb.GetRegex(),
-		PrefixRewrite:                    pb.GetPrefixRewrite(),
-		RegexRewritePattern:              pb.GetRegexRewritePattern(),
-		RegexRewriteSubstitution:         pb.GetRegexRewriteSubstitution(),
-		CORSAllowPreflight:               pb.GetCorsAllowPreflight(),
+		AllowedUsers:                     pb.GetAllowedUsers(),
 		AllowPublicUnauthenticatedAccess: pb.GetAllowPublicUnauthenticatedAccess(),
-		AllowAnyAuthenticatedUser:        pb.GetAllowAnyAuthenticatedUser(),
-		UpstreamTimeout:                  timeout,
-		IdleTimeout:                      idleTimeout,
-		AllowWebsockets:                  pb.GetAllowWebsockets(),
 		AllowSPDY:                        pb.GetAllowSpdy(),
-		TLSSkipVerify:                    pb.GetTlsSkipVerify(),
-		TLSServerName:                    pb.GetTlsServerName(),
-		TLSDownstreamServerName:          pb.GetTlsDownstreamServerName(),
-		TLSUpstreamServerName:            pb.GetTlsUpstreamServerName(),
-		TLSCustomCA:                      pb.GetTlsCustomCa(),
-		TLSCustomCAFile:                  pb.GetTlsCustomCaFile(),
-		TLSClientCert:                    pb.GetTlsClientCert(),
-		TLSClientKey:                     pb.GetTlsClientKey(),
-		TLSClientCertFile:                pb.GetTlsClientCertFile(),
-		TLSClientKeyFile:                 pb.GetTlsClientKeyFile(),
-		TLSDownstreamClientCA:            pb.GetTlsDownstreamClientCa(),
-		TLSDownstreamClientCAFile:        pb.GetTlsDownstreamClientCaFile(),
-		SetAuthorizationHeader:           pb.GetSetAuthorizationHeader().String(),
-		SetRequestHeaders:                pb.GetSetRequestHeaders(),
-		RemoveRequestHeaders:             pb.GetRemoveRequestHeaders(),
-		PreserveHostHeader:               pb.GetPreserveHostHeader(),
-		HostRewrite:                      pb.GetHostRewrite(),
-		HostRewriteHeader:                pb.GetHostRewriteHeader(),
-		HostPathRegexRewritePattern:      pb.GetHostPathRegexRewritePattern(),
-		HostPathRegexRewriteSubstitution: pb.GetHostPathRegexRewriteSubstitution(),
-		PassIdentityHeaders:              pb.GetPassIdentityHeaders(),
-		KubernetesServiceAccountToken:    pb.GetKubernetesServiceAccountToken(),
-		SetResponseHeaders:               pb.GetSetResponseHeaders(),
+		AllowWebsockets:                  pb.GetAllowWebsockets(),
+		CORSAllowPreflight:               pb.GetCorsAllowPreflight(),
+		Description:                      pb.GetDescription(),
 		EnableGoogleCloudServerlessAuthentication: pb.GetEnableGoogleCloudServerlessAuthentication(),
-		IDPClientID:     pb.GetIdpClientId(),
-		IDPClientSecret: pb.GetIdpClientSecret(),
+		From:                              pb.GetFrom(),
+		HostPathRegexRewritePattern:       pb.GetHostPathRegexRewritePattern(),
+		HostPathRegexRewriteSubstitution:  pb.GetHostPathRegexRewriteSubstitution(),
+		HostRewrite:                       pb.GetHostRewrite(),
+		HostRewriteHeader:                 pb.GetHostRewriteHeader(),
+		ID:                                pb.GetId(),
+		IdleTimeout:                       idleTimeout,
+		IDPClientID:                       pb.GetIdpClientId(),
+		IDPClientSecret:                   pb.GetIdpClientSecret(),
+		JWTGroupsFilter:                   NewJWTGroupsFilter(pb.JwtGroupsFilter),
+		KubernetesServiceAccountToken:     pb.GetKubernetesServiceAccountToken(),
+		KubernetesServiceAccountTokenFile: pb.GetKubernetesServiceAccountTokenFile(),
+		LogoURL:                           pb.GetLogoUrl(),
+		Name:                              pb.GetName(),
+		PassIdentityHeaders:               pb.PassIdentityHeaders,
+		Path:                              pb.GetPath(),
+		Prefix:                            pb.GetPrefix(),
+		PrefixRewrite:                     pb.GetPrefixRewrite(),
+		PreserveHostHeader:                pb.GetPreserveHostHeader(),
+		Regex:                             pb.GetRegex(),
+		RegexPriorityOrder:                pb.RegexPriorityOrder,
+		RegexRewritePattern:               pb.GetRegexRewritePattern(),
+		RegexRewriteSubstitution:          pb.GetRegexRewriteSubstitution(),
+		RemoveRequestHeaders:              pb.GetRemoveRequestHeaders(),
+		SetRequestHeaders:                 pb.GetSetRequestHeaders(),
+		SetResponseHeaders:                pb.GetSetResponseHeaders(),
+		ShowErrorDetails:                  pb.GetShowErrorDetails(),
+		TLSClientCert:                     pb.GetTlsClientCert(),
+		TLSClientCertFile:                 pb.GetTlsClientCertFile(),
+		TLSClientKey:                      pb.GetTlsClientKey(),
+		TLSClientKeyFile:                  pb.GetTlsClientKeyFile(),
+		TLSCustomCA:                       pb.GetTlsCustomCa(),
+		TLSCustomCAFile:                   pb.GetTlsCustomCaFile(),
+		TLSDownstreamClientCA:             pb.GetTlsDownstreamClientCa(),
+		TLSDownstreamClientCAFile:         pb.GetTlsDownstreamClientCaFile(),
+		TLSDownstreamServerName:           pb.GetTlsDownstreamServerName(),
+		TLSServerName:                     pb.GetTlsServerName(),
+		TLSSkipVerify:                     pb.GetTlsSkipVerify(),
+		TLSUpstreamAllowRenegotiation:     pb.GetTlsUpstreamAllowRenegotiation(),
+		TLSUpstreamServerName:             pb.GetTlsUpstreamServerName(),
+		UpstreamTimeout:                   timeout,
 	}
-
 	if pb.Redirect.IsSet() {
 		p.Redirect = &PolicyRedirect{
 			HTTPSRedirect:  pb.Redirect.HttpsRedirect,
@@ -278,13 +343,26 @@ func NewPolicyFromProto(pb *configpb.Route) (*Policy, error) {
 			ResponseCode:   pb.Redirect.ResponseCode,
 			StripQuery:     pb.Redirect.StripQuery,
 		}
-	} else {
-		to, err := ParseWeightedUrls(pb.GetTo()...)
-		if err != nil {
-			return nil, err
+	} else if pb.Response != nil {
+		p.Response = &DirectResponse{
+			Status: int(pb.Response.GetStatus()),
+			Body:   pb.Response.GetBody(),
 		}
-
-		p.To = to
+	} else {
+		p.To = make(WeightedURLs, len(pb.To))
+		for i, u := range pb.To {
+			u, err := urlutil.ParseAndValidateURL(u)
+			if err != nil {
+				return nil, err
+			}
+			w := WeightedURL{
+				URL: *u,
+			}
+			if len(pb.LoadBalancingWeights) == len(pb.To) {
+				w.LbWeight = pb.LoadBalancingWeights[i]
+			}
+			p.To[i] = w
+		}
 	}
 
 	p.EnvoyOpts = pb.EnvoyOpts
@@ -293,6 +371,13 @@ func NewPolicyFromProto(pb *configpb.Route) (*Policy, error) {
 	}
 	if pb.Name != "" && p.EnvoyOpts.Name == "" {
 		p.EnvoyOpts.Name = pb.Name
+	}
+
+	switch pb.GetJwtIssuerFormat() {
+	case configpb.IssuerFormat_IssuerHostOnly:
+		p.JWTIssuerFormat = "hostOnly"
+	case configpb.IssuerFormat_IssuerURI:
+		p.JWTIssuerFormat = "uri"
 	}
 
 	for _, rwh := range pb.RewriteResponseHeaders {
@@ -308,13 +393,16 @@ func NewPolicyFromProto(pb *configpb.Route) (*Policy, error) {
 			ID:               sp.GetId(),
 			Name:             sp.GetName(),
 			AllowedUsers:     sp.GetAllowedUsers(),
-			AllowedGroups:    sp.GetAllowedGroups(),
 			AllowedDomains:   sp.GetAllowedDomains(),
 			AllowedIDPClaims: identity.NewFlattenedClaimsFromPB(sp.GetAllowedIdpClaims()),
 			Rego:             sp.GetRego(),
+			SourcePPL:        sp.GetSourcePpl(),
+
+			Explanation: sp.GetExplanation(),
+			Remediation: sp.GetRemediation(),
 		})
 	}
-	return p, p.Validate()
+	return p, nil
 }
 
 // ToProto converts the policy to a protobuf type.
@@ -331,57 +419,85 @@ func (p *Policy) ToProto() (*configpb.Route, error) {
 	}
 	sps := make([]*configpb.Policy, 0, len(p.SubPolicies))
 	for _, sp := range p.SubPolicies {
-		sps = append(sps, &configpb.Policy{
+		p := &configpb.Policy{
 			Id:               sp.ID,
 			Name:             sp.Name,
 			AllowedUsers:     sp.AllowedUsers,
-			AllowedGroups:    sp.AllowedGroups,
 			AllowedDomains:   sp.AllowedDomains,
 			AllowedIdpClaims: sp.AllowedIDPClaims.ToPB(),
+			Explanation:      sp.Explanation,
+			Remediation:      sp.Remediation,
 			Rego:             sp.Rego,
-		})
+		}
+		if sp.SourcePPL != "" {
+			p.SourcePpl = proto.String(sp.SourcePPL)
+		}
+		sps = append(sps, p)
 	}
 
 	pb := &configpb.Route{
-		Name:                             fmt.Sprint(p.RouteID()),
-		From:                             p.From,
-		AllowedUsers:                     p.AllowedUsers,
-		AllowedGroups:                    p.AllowedGroups,
+		AllowAnyAuthenticatedUser:        p.AllowAnyAuthenticatedUser,
 		AllowedDomains:                   p.AllowedDomains,
 		AllowedIdpClaims:                 p.AllowedIDPClaims.ToPB(),
-		Prefix:                           p.Prefix,
-		Path:                             p.Path,
-		Regex:                            p.Regex,
-		PrefixRewrite:                    p.PrefixRewrite,
-		RegexRewritePattern:              p.RegexRewritePattern,
-		RegexRewriteSubstitution:         p.RegexRewriteSubstitution,
-		CorsAllowPreflight:               p.CORSAllowPreflight,
+		AllowedUsers:                     p.AllowedUsers,
 		AllowPublicUnauthenticatedAccess: p.AllowPublicUnauthenticatedAccess,
-		AllowAnyAuthenticatedUser:        p.AllowAnyAuthenticatedUser,
-		Timeout:                          timeout,
-		IdleTimeout:                      idleTimeout,
-		AllowWebsockets:                  p.AllowWebsockets,
 		AllowSpdy:                        p.AllowSPDY,
-		TlsSkipVerify:                    p.TLSSkipVerify,
-		TlsServerName:                    p.TLSServerName,
-		TlsUpstreamServerName:            p.TLSUpstreamServerName,
-		TlsDownstreamServerName:          p.TLSDownstreamServerName,
-		TlsCustomCa:                      p.TLSCustomCA,
-		TlsCustomCaFile:                  p.TLSCustomCAFile,
-		TlsClientCert:                    p.TLSClientCert,
-		TlsClientKey:                     p.TLSClientKey,
-		TlsClientCertFile:                p.TLSClientCertFile,
-		TlsClientKeyFile:                 p.TLSClientKeyFile,
-		TlsDownstreamClientCa:            p.TLSDownstreamClientCA,
-		TlsDownstreamClientCaFile:        p.TLSDownstreamClientCAFile,
-		SetRequestHeaders:                p.SetRequestHeaders,
-		RemoveRequestHeaders:             p.RemoveRequestHeaders,
-		PreserveHostHeader:               p.PreserveHostHeader,
-		PassIdentityHeaders:              p.PassIdentityHeaders,
-		SetAuthorizationHeader:           p.GetSetAuthorizationHeader(),
-		KubernetesServiceAccountToken:    p.KubernetesServiceAccountToken,
-		Policies:                         sps,
-		SetResponseHeaders:               p.SetResponseHeaders,
+		AllowWebsockets:                  p.AllowWebsockets,
+		CorsAllowPreflight:               p.CORSAllowPreflight,
+		Description:                      p.Description,
+		EnableGoogleCloudServerlessAuthentication: p.EnableGoogleCloudServerlessAuthentication,
+		EnvoyOpts:                         p.EnvoyOpts,
+		From:                              p.From,
+		Id:                                p.ID,
+		IdleTimeout:                       idleTimeout,
+		JwtGroupsFilter:                   p.JWTGroupsFilter.ToSlice(),
+		KubernetesServiceAccountToken:     p.KubernetesServiceAccountToken,
+		KubernetesServiceAccountTokenFile: p.KubernetesServiceAccountTokenFile,
+		LogoUrl:                           p.LogoURL,
+		Name:                              p.Name,
+		PassIdentityHeaders:               p.PassIdentityHeaders,
+		Path:                              p.Path,
+		Policies:                          sps,
+		Prefix:                            p.Prefix,
+		PrefixRewrite:                     p.PrefixRewrite,
+		PreserveHostHeader:                p.PreserveHostHeader,
+		Regex:                             p.Regex,
+		RegexPriorityOrder:                p.RegexPriorityOrder,
+		RegexRewritePattern:               p.RegexRewritePattern,
+		RegexRewriteSubstitution:          p.RegexRewriteSubstitution,
+		RemoveRequestHeaders:              p.RemoveRequestHeaders,
+		SetRequestHeaders:                 p.SetRequestHeaders,
+		SetResponseHeaders:                p.SetResponseHeaders,
+		ShowErrorDetails:                  p.ShowErrorDetails,
+		Timeout:                           timeout,
+		TlsClientCert:                     p.TLSClientCert,
+		TlsClientCertFile:                 p.TLSClientCertFile,
+		TlsClientKey:                      p.TLSClientKey,
+		TlsClientKeyFile:                  p.TLSClientKeyFile,
+		TlsCustomCa:                       p.TLSCustomCA,
+		TlsCustomCaFile:                   p.TLSCustomCAFile,
+		TlsDownstreamClientCa:             p.TLSDownstreamClientCA,
+		TlsDownstreamClientCaFile:         p.TLSDownstreamClientCAFile,
+		TlsDownstreamServerName:           p.TLSDownstreamServerName,
+		TlsServerName:                     p.TLSServerName,
+		TlsSkipVerify:                     p.TLSSkipVerify,
+		TlsUpstreamAllowRenegotiation:     p.TLSUpstreamAllowRenegotiation,
+		TlsUpstreamServerName:             p.TLSUpstreamServerName,
+	}
+	if pb.Name == "" {
+		pb.Name = fmt.Sprint(p.RouteID())
+	}
+	if p.HostPathRegexRewritePattern != "" {
+		pb.HostPathRegexRewritePattern = proto.String(p.HostPathRegexRewritePattern)
+	}
+	if p.HostPathRegexRewriteSubstitution != "" {
+		pb.HostPathRegexRewriteSubstitution = proto.String(p.HostPathRegexRewriteSubstitution)
+	}
+	if p.HostRewrite != "" {
+		pb.HostRewrite = proto.String(p.HostRewrite)
+	}
+	if p.HostRewriteHeader != "" {
+		pb.HostRewriteHeader = proto.String(p.HostRewriteHeader)
 	}
 	if p.IDPClientID != "" {
 		pb.IdpClientId = proto.String(p.IDPClientID)
@@ -400,6 +516,11 @@ func (p *Policy) ToProto() (*configpb.Route, error) {
 			ResponseCode:   p.Redirect.ResponseCode,
 			StripQuery:     p.Redirect.StripQuery,
 		}
+	} else if p.Response != nil {
+		pb.Response = &configpb.RouteDirectResponse{
+			Status: uint32(p.Response.Status),
+			Body:   p.Response.Body,
+		}
 	} else {
 		to, weights, err := p.To.Flatten()
 		if err != nil {
@@ -408,6 +529,13 @@ func (p *Policy) ToProto() (*configpb.Route, error) {
 
 		pb.To = to
 		pb.LoadBalancingWeights = weights
+	}
+
+	switch p.JWTIssuerFormat {
+	case "", "hostOnly":
+		pb.JwtIssuerFormat = configpb.IssuerFormat_IssuerHostOnly
+	case "uri":
+		pb.JwtIssuerFormat = configpb.IssuerFormat_IssuerURI
 	}
 
 	for _, rwh := range p.RewriteResponseHeaders {
@@ -437,29 +565,41 @@ func (p *Policy) Validate() error {
 			source.String())
 	}
 	if source.Scheme == "http" {
-		log.Warn(context.Background()).Msgf("config: policy source url (%s) uses HTTP but only HTTPS is supported",
+		log.Info().Msgf("config: policy source url (%s) uses HTTP but only HTTPS is supported",
 			source.String())
 	}
 
-	p.Source = &StringURL{source}
-
-	if len(p.To) == 0 && p.Redirect == nil {
-		return errEitherToOrRedirectRequired
+	if len(p.To) == 0 && p.Redirect == nil && p.Response == nil {
+		return errEitherToOrRedirectOrResponseRequired
 	}
 
+	toSchemes := make(map[string]struct{})
 	for _, u := range p.To {
 		if err = u.Validate(); err != nil {
 			return fmt.Errorf("config: %s: %w", u.URL.String(), err)
 		}
+		toSchemes[u.URL.Scheme] = struct{}{}
+	}
+
+	// It is an error to mix TCP and non-TCP To URLs.
+	if _, hasTCP := toSchemes["tcp"]; hasTCP && len(toSchemes) > 1 {
+		return fmt.Errorf("config: cannot mix tcp and non-tcp To URLs")
+	}
+	if _, hasUDP := toSchemes["udp"]; hasUDP && len(toSchemes) > 1 {
+		return fmt.Errorf("config: cannot mix udp and non-udp To URLs")
+	}
+
+	if err := p.Redirect.validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 
 	// Only allow public access if no other whitelists are in place
-	if p.AllowPublicUnauthenticatedAccess && (p.AllowAnyAuthenticatedUser || p.AllowedDomains != nil || p.AllowedGroups != nil || p.AllowedUsers != nil) {
+	if p.AllowPublicUnauthenticatedAccess && (p.AllowAnyAuthenticatedUser || p.AllowedDomains != nil || p.AllowedUsers != nil) {
 		return fmt.Errorf("config: policy route marked as public but contains whitelists")
 	}
 
 	// Only allow any authenticated user if no other whitelists are in place
-	if p.AllowAnyAuthenticatedUser && (p.AllowedDomains != nil || p.AllowedGroups != nil || p.AllowedUsers != nil) {
+	if p.AllowAnyAuthenticatedUser && (p.AllowedDomains != nil || p.AllowedUsers != nil) {
 		return fmt.Errorf("config: policy route marked accessible for any authenticated user but contains whitelists")
 	}
 
@@ -486,13 +626,18 @@ func (p *Policy) Validate() error {
 			return fmt.Errorf("config: couldn't decode custom ca: %w", err)
 		}
 	} else if p.TLSCustomCAFile != "" {
-		_, err := os.Stat(p.TLSCustomCAFile)
+		ca, err := os.ReadFile(p.TLSCustomCAFile)
 		if err != nil {
 			return fmt.Errorf("config: couldn't load client ca file: %w", err)
 		}
+		p.TLSCustomCA = base64.StdEncoding.EncodeToString(ca)
 	}
 
+	const clientCADeprecationMsg = "config: %s is deprecated, see https://www.pomerium.com/docs/" +
+		"reference/routes/tls#tls-downstream-client-certificate-authority for more information"
+
 	if p.TLSDownstreamClientCA != "" {
+		log.Info().Msgf(clientCADeprecationMsg, "tls_downstream_client_ca")
 		_, err := base64.StdEncoding.DecodeString(p.TLSDownstreamClientCA)
 		if err != nil {
 			return fmt.Errorf("config: couldn't decode downstream client ca: %w", err)
@@ -500,6 +645,7 @@ func (p *Policy) Validate() error {
 	}
 
 	if p.TLSDownstreamClientCAFile != "" {
+		log.Info().Msgf(clientCADeprecationMsg, "tls_downstream_client_ca_file")
 		bs, err := os.ReadFile(p.TLSDownstreamClientCAFile)
 		if err != nil {
 			return fmt.Errorf("config: couldn't load downstream client ca: %w", err)
@@ -507,16 +653,8 @@ func (p *Policy) Validate() error {
 		p.TLSDownstreamClientCA = base64.StdEncoding.EncodeToString(bs)
 	}
 
-	if p.KubernetesServiceAccountTokenFile != "" {
-		if p.KubernetesServiceAccountToken != "" {
-			return fmt.Errorf("config: specified both `kubernetes_service_account_token_file` and `kubernetes_service_account_token`")
-		}
-
-		token, err := os.ReadFile(p.KubernetesServiceAccountTokenFile)
-		if err != nil {
-			return fmt.Errorf("config: failed to load kubernetes service account token: %w", err)
-		}
-		p.KubernetesServiceAccountToken = string(token)
+	if p.KubernetesServiceAccountTokenFile != "" && p.KubernetesServiceAccountToken != "" {
+		return fmt.Errorf("config: specified both `kubernetes_service_account_token_file` and `kubernetes_service_account_token`")
 	}
 
 	if p.PrefixRewrite != "" && p.RegexRewritePattern != "" {
@@ -534,10 +672,6 @@ func (p *Policy) Validate() error {
 		p.compiledRegex, _ = regexp.Compile(rawRE)
 	}
 
-	if _, ok := configpb.Route_AuthorizationHeaderModeFromString(p.SetAuthorizationHeader); !ok && p.SetAuthorizationHeader != "" {
-		return fmt.Errorf("config: invalid policy set_authorization_header: %v", p.SetAuthorizationHeader)
-	}
-
 	return nil
 }
 
@@ -546,28 +680,71 @@ func (p *Policy) Checksum() uint64 {
 	return hashutil.MustHash(p)
 }
 
-// RouteID returns a unique identifier for a route
+// RouteID returns a unique identifier for a route.
+//
+// The following fields are used to compute the ID:
+// - from
+// - prefix
+// - path
+// - regex
+// - to/redirect/response (whichever is set)
 func (p *Policy) RouteID() (uint64, error) {
-	id := routeID{
-		Source: p.Source,
-		Prefix: p.Prefix,
-		Path:   p.Path,
-		Regex:  p.Regex,
-	}
-
-	if len(p.To) > 0 {
-		dst, _, err := p.To.Flatten()
-		if err != nil {
-			return 0, err
+	// this function is in the hot path, try not to allocate too much memory here
+	hash := hashutil.NewDigest()
+	hash.WriteStringWithLen(p.From)
+	hash.WriteStringWithLen(p.Prefix)
+	hash.WriteStringWithLen(p.Path)
+	hash.WriteStringWithLen(p.Regex)
+	switch {
+	case len(p.To) > 0:
+		_, _ = hash.Write([]byte{1}) // case 1
+		hash.WriteInt32(int32(len(p.To)))
+		for _, to := range p.To {
+			hash.WriteStringWithLen(to.URL.Scheme)
+			hash.WriteStringWithLen(to.URL.Opaque)
+			if to.URL.User == nil {
+				_, _ = hash.Write([]byte{0})
+			} else {
+				_, _ = hash.Write([]byte{1})
+				hash.WriteStringWithLen(to.URL.User.Username())
+				p, _ := to.URL.User.Password()
+				hash.WriteStringWithLen(p)
+			}
+			hash.WriteStringWithLen(to.URL.Host)
+			hash.WriteStringWithLen(to.URL.Path)
+			hash.WriteStringWithLen(to.URL.RawPath)
+			hash.WriteBool(to.URL.OmitHost)
+			hash.WriteBool(to.URL.ForceQuery)
+			hash.WriteStringWithLen(to.URL.Fragment)
+			hash.WriteStringWithLen(to.URL.RawFragment)
+			hash.WriteUint32(to.LbWeight)
 		}
-		id.To = dst
-	} else if p.Redirect != nil {
-		id.Redirect = p.Redirect
-	} else {
-		return 0, errEitherToOrRedirectRequired
+	case p.Redirect != nil:
+		_, _ = hash.Write([]byte{2}) // case 2
+		hash.WriteBoolPtr(p.Redirect.HTTPSRedirect)
+		hash.WriteStringPtrWithLen(p.Redirect.SchemeRedirect)
+		hash.WriteStringPtrWithLen(p.Redirect.HostRedirect)
+		hash.WriteUint32Ptr(p.Redirect.PortRedirect)
+		hash.WriteStringPtrWithLen(p.Redirect.PathRedirect)
+		hash.WriteStringPtrWithLen(p.Redirect.PrefixRewrite)
+		hash.WriteInt32Ptr(p.Redirect.ResponseCode)
+		hash.WriteBoolPtr(p.Redirect.StripQuery)
+	case p.Response != nil:
+		_, _ = hash.Write([]byte{3}) // case 3
+		hash.WriteInt32(int32(p.Response.Status))
+		hash.WriteStringWithLen(p.Response.Body)
+	default:
+		return 0, errEitherToOrRedirectOrResponseRequired
 	}
+	return hash.Sum64(), nil
+}
 
-	return hashutil.Hash(id)
+func (p *Policy) MustRouteID() uint64 {
+	id, err := p.RouteID()
+	if err != nil {
+		panic(err)
+	}
+	return id
 }
 
 func (p *Policy) String() string {
@@ -580,17 +757,18 @@ func (p *Policy) String() string {
 		to = strings.Join(dsts, ",")
 	}
 
-	return fmt.Sprintf("%s → %s", p.Source.String(), to)
+	return fmt.Sprintf("%s → %s", p.From, to)
 }
 
 // Matches returns true if the policy would match the given URL.
-func (p *Policy) Matches(requestURL url.URL) bool {
-	// handle nils by always returning false
-	if p.Source == nil {
+func (p *Policy) Matches(requestURL *url.URL, stripPort bool) bool {
+	// an invalid from URL should not match anything
+	fromURL, err := urlutil.ParseAndValidateURL(p.From)
+	if err != nil {
 		return false
 	}
 
-	if p.Source.Host != requestURL.Host {
+	if !FromURLMatchesRequestURL(fromURL, requestURL, stripPort) {
 		return false
 	}
 
@@ -620,6 +798,26 @@ func (p *Policy) IsForKubernetes() bool {
 	return p.KubernetesServiceAccountTokenFile != "" || p.KubernetesServiceAccountToken != ""
 }
 
+// IsTCP returns true if the route is for TCP.
+func (p *Policy) IsTCP() bool {
+	return strings.HasPrefix(p.From, "tcp")
+}
+
+// IsTCPUpstream returns true if the route has a TCP upstream (To) URL
+func (p *Policy) IsTCPUpstream() bool {
+	return len(p.To) > 0 && p.To[0].URL.Scheme == "tcp"
+}
+
+// IsUDP returns true if the route is for UDP.
+func (p *Policy) IsUDP() bool {
+	return strings.HasPrefix(p.From, "udp")
+}
+
+// IsUDPUpstream returns true if the route has a UDP upstream (To) URL
+func (p *Policy) IsUDPUpstream() bool {
+	return len(p.To) > 0 && p.To[0].URL.Scheme == "udp"
+}
+
 // AllAllowedDomains returns all the allowed domains.
 func (p *Policy) AllAllowedDomains() []string {
 	var ads []string
@@ -628,16 +826,6 @@ func (p *Policy) AllAllowedDomains() []string {
 		ads = append(ads, sp.AllowedDomains...)
 	}
 	return ads
-}
-
-// AllAllowedGroups returns all the allowed groups.
-func (p *Policy) AllAllowedGroups() []string {
-	var ags []string
-	ags = append(ags, p.AllowedGroups...)
-	for _, sp := range p.SubPolicies {
-		ags = append(ags, sp.AllowedGroups...)
-	}
-	return ags
 }
 
 // AllAllowedIDPClaims returns all the allowed IDP claims.
@@ -664,34 +852,107 @@ func (p *Policy) AllAllowedUsers() []string {
 	return aus
 }
 
-// GetSetAuthorizationHeader gets the set authorization header mode.
-func (p *Policy) GetSetAuthorizationHeader() configpb.Route_AuthorizationHeaderMode {
-	mode, _ := configpb.Route_AuthorizationHeaderModeFromString(p.SetAuthorizationHeader)
-	return mode
-}
-
-// StringURL stores a URL as a string in json.
-type StringURL struct {
-	*url.URL
-}
-
-func (su *StringURL) String() string {
-	if su == nil || su.URL == nil {
-		return "?"
+// GetKubernetesServiceAccountToken gets the kubernetes service account token from a file or from the config option.
+func (p *Policy) GetKubernetesServiceAccountToken() (string, error) {
+	if p.KubernetesServiceAccountTokenFile != "" {
+		bs, err := os.ReadFile(p.KubernetesServiceAccountTokenFile)
+		return string(bs), err
 	}
-	return su.URL.String()
+
+	if p.KubernetesServiceAccountToken != "" {
+		return p.KubernetesServiceAccountToken, nil
+	}
+
+	return "", nil
 }
 
-// MarshalJSON returns the URLs host as json.
-func (su *StringURL) MarshalJSON() ([]byte, error) {
-	return json.Marshal(su.String())
+// GetPassIdentityHeaders gets the pass identity headers option. If not set in the policy, use the setting from the
+// options. If not set in either, return false.
+func (p *Policy) GetPassIdentityHeaders(options *Options) bool {
+	if p != nil && p.PassIdentityHeaders != nil {
+		return *p.PassIdentityHeaders
+	}
+
+	if options != nil && options.PassIdentityHeaders != nil {
+		return *options.PassIdentityHeaders
+	}
+
+	return false
 }
 
-type routeID struct {
-	Source   *StringURL
-	To       []string
-	Prefix   string
-	Path     string
-	Regex    string
-	Redirect *PolicyRedirect
+// GetFrom gets the from URL.
+func (p *Policy) GetFrom() string {
+	return p.From
+}
+
+// GetPath gets the path.
+func (p *Policy) GetPath() string {
+	return p.Path
+}
+
+// GetPrefix gets the prefix.
+func (p *Policy) GetPrefix() string {
+	return p.Prefix
+}
+
+// GetRegex gets the regex.
+func (p *Policy) GetRegex() string {
+	return p.Regex
+}
+
+/*
+SortPolicies sorts policies to match the following SQL order:
+
+	  ORDER BY from ASC,
+		path DESC NULLS LAST,
+		regex_priority_order DESC NULLS LAST,
+		regex DESC NULLS LAST
+		prefix DESC NULLS LAST,
+		id ASC
+*/
+func SortPolicies(pp []Policy) {
+	sort.SliceStable(pp, func(i, j int) bool {
+		strDesc := func(a, b string) (val bool, equal bool) {
+			return a > b, a == b
+		}
+
+		strAsc := func(a, b string) (val bool, equal bool) {
+			return a < b, a == b
+		}
+
+		intPDesc := func(a, b *int64) (val bool, equal bool) {
+			if a == nil && b == nil {
+				return false, true
+			}
+			if a == nil && b != nil {
+				return false, false
+			}
+			if a != nil && b == nil {
+				return true, false
+			}
+			return *a > *b, *a == *b
+		}
+
+		if val, equal := strAsc(pp[i].From, pp[j].From); !equal {
+			return val
+		}
+
+		if val, equal := strDesc(pp[i].Path, pp[j].Path); !equal {
+			return val
+		}
+
+		if val, equal := intPDesc(pp[i].RegexPriorityOrder, pp[j].RegexPriorityOrder); !equal {
+			return val
+		}
+
+		if val, equal := strDesc(pp[i].Regex, pp[j].Regex); !equal {
+			return val
+		}
+
+		if val, equal := strDesc(pp[i].Prefix, pp[j].Prefix); !equal {
+			return val
+		}
+
+		return pp[i].ID < pp[j].ID // Ascending order for ID
+	})
 }

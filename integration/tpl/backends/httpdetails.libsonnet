@@ -4,8 +4,9 @@ local Variations() =
   [
     {
       name: 'trusted',
-      cert: importstr '../files/trusted.pem',
-      key: importstr '../files/trusted-key.pem',
+      cert: importstr '../files/trusted-sans.pem',
+      key: importstr '../files/trusted-sans-key.pem',
+      ipv4Address: '172.20.0.50',
     },
     {
       name: 'trusted-1',
@@ -60,6 +61,11 @@ function() {
         utils.ComposeService(variation.name + '-' + suffix, {
           image: image,
           command: Command(variation),
+          [if std.get(variation, 'ipv4Address') != null then 'networks']: {
+            main: {
+              ipv4_address: variation.ipv4Address,
+            }
+          },
         }) +
         utils.ComposeService(variation.name + '-' + suffix + '-ready', {
           image: 'jwilder/dockerize:0.6.1',
@@ -78,10 +84,14 @@ function() {
   kubernetes: std.foldl(
     function(acc, variation)
       acc + [
-        utils.KubernetesDeployment(variation.name + '-' + suffix, image, Command(variation), [
-          { name: 'http', containerPort: 8080 },
-          { name: 'https', containerPort: 8443 },
-        ]),
+        utils.KubernetesDeployment(variation.name + '-' + suffix, {
+          image: image,
+          args: Command(variation),
+          ports: [
+            { name: 'http', containerPort: 8080 },
+            { name: 'https', containerPort: 8443 },
+          ],
+        }),
         utils.KubernetesService(variation.name + '-' + suffix, [
           { name: 'http', port: 8080, targetPort: 'http' },
           { name: 'https', port: 8443, targetPort: 'https' },

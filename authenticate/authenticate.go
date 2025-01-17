@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/pomerium/pomerium/authenticate/handlers/webauthn"
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 )
@@ -23,7 +23,11 @@ func ValidateOptions(o *config.Options) error {
 	if _, err := cryptutil.NewAEADCipher(sharedKey); err != nil {
 		return fmt.Errorf("authenticate: 'SHARED_SECRET' invalid: %w", err)
 	}
-	if _, err := cryptutil.NewAEADCipherFromBase64(o.CookieSecret); err != nil {
+	cookieSecret, err := o.GetCookieSecret()
+	if err != nil {
+		return fmt.Errorf("authenticate: 'COOKIE_SECRET' invalid: %w", err)
+	}
+	if _, err := cryptutil.NewAEADCipher(cookieSecret); err != nil {
 		return fmt.Errorf("authenticate: 'COOKIE_SECRET' invalid %w", err)
 	}
 	if o.AuthenticateCallbackPath == "" {
@@ -34,22 +38,23 @@ func ValidateOptions(o *config.Options) error {
 
 // Authenticate contains data required to run the authenticate service.
 type Authenticate struct {
-	cfg      *authenticateConfig
-	options  *config.AtomicOptions
-	state    *atomicAuthenticateState
-	webauthn *webauthn.Handler
+	cfg     *authenticateConfig
+	options *atomicutil.Value[*config.Options]
+	state   *atomicutil.Value[*authenticateState]
 }
 
 // New validates and creates a new authenticate service from a set of Options.
-func New(cfg *config.Config, options ...Option) (*Authenticate, error) {
+func New(ctx context.Context, cfg *config.Config, options ...Option) (*Authenticate, error) {
+	authenticateConfig := getAuthenticateConfig(options...)
 	a := &Authenticate{
-		cfg:     getAuthenticateConfig(options...),
+		cfg:     authenticateConfig,
 		options: config.NewAtomicOptions(),
-		state:   newAtomicAuthenticateState(newAuthenticateState()),
+		state:   atomicutil.NewValue(newAuthenticateState()),
 	}
-	a.webauthn = webauthn.New(a.getWebauthnState)
 
-	state, err := newAuthenticateStateFromConfig(cfg)
+	a.options.Store(cfg.Options)
+
+	state, err := newAuthenticateStateFromConfig(ctx, cfg, authenticateConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -65,8 +70,8 @@ func (a *Authenticate) OnConfigChange(ctx context.Context, cfg *config.Config) {
 	}
 
 	a.options.Store(cfg.Options)
-	if state, err := newAuthenticateStateFromConfig(cfg); err != nil {
-		log.Error(ctx).Err(err).Msg("authenticate: failed to update state")
+	if state, err := newAuthenticateStateFromConfig(ctx, cfg, a.cfg); err != nil {
+		log.Ctx(ctx).Error().Err(err).Msg("authenticate: failed to update state")
 	} else {
 		a.state.Store(state)
 	}

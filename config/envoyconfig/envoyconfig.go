@@ -4,13 +4,10 @@ package envoyconfig
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -21,8 +18,6 @@ import (
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_extensions_access_loggers_grpc_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
-	envoy_extensions_transport_sockets_tls_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/martinlindhe/base36"
 	"golang.org/x/net/nettest"
 	"google.golang.org/protobuf/proto"
@@ -31,6 +26,8 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/internal/fileutil"
+	"github.com/pomerium/pomerium/internal/httputil"
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 )
@@ -44,14 +41,14 @@ var (
 type Endpoint struct {
 	url                url.URL
 	transportSocket    *envoy_config_core_v3.TransportSocket
-	loadBalancerWeight *wrappers.UInt32Value
+	loadBalancerWeight *wrapperspb.UInt32Value
 }
 
 // NewEndpoint creates a new Endpoint.
 func NewEndpoint(u *url.URL, ts *envoy_config_core_v3.TransportSocket, weight uint32) Endpoint {
-	var w *wrappers.UInt32Value
+	var w *wrapperspb.UInt32Value
 	if weight > 0 {
-		w = &wrappers.UInt32Value{Value: weight}
+		w = &wrapperspb.UInt32Value{Value: weight}
 	}
 	return Endpoint{url: *u, transportSocket: ts, loadBalancerWeight: w}
 }
@@ -70,7 +67,7 @@ func newDefaultEnvoyClusterConfig() *envoy_config_cluster_v3.Cluster {
 	return &envoy_config_cluster_v3.Cluster{
 		ConnectTimeout:                defaultConnectionTimeout,
 		RespectDnsTtl:                 true,
-		DnsLookupFamily:               envoy_config_cluster_v3.Cluster_AUTO,
+		DnsLookupFamily:               envoy_config_cluster_v3.Cluster_V4_PREFERRED,
 		PerConnectionBufferLimitBytes: wrapperspb.UInt32(connectionBufferLimit),
 	}
 }
@@ -81,14 +78,21 @@ func buildAccessLogs(options *config.Options) []*envoy_config_accesslog_v3.Acces
 		lvl = options.LogLevel
 	}
 	if lvl == "" {
-		lvl = "debug"
+		lvl = config.LogLevelDebug
 	}
 
 	switch lvl {
-	case "trace", "debug", "info":
+	case config.LogLevelTrace, config.LogLevelDebug, config.LogLevelInfo:
 	default:
 		// don't log access requests for levels > info
 		return nil
+	}
+
+	var additionalRequestHeaders []string
+	for _, field := range options.AccessLogFields {
+		if headerName, ok := log.GetHeaderField(field); ok {
+			additionalRequestHeaders = append(additionalRequestHeaders, httputil.CanonicalHeaderKey(headerName))
+		}
 	}
 
 	tc := marshalAny(&envoy_extensions_access_loggers_grpc_v3.HttpGrpcAccessLogConfig{
@@ -103,6 +107,7 @@ func buildAccessLogs(options *config.Options) []*envoy_config_accesslog_v3.Acces
 			},
 			TransportApiVersion: envoy_config_core_v3.ApiVersion_V3,
 		},
+		AdditionalRequestHeadersToLog: additionalRequestHeaders,
 	})
 	return []*envoy_config_accesslog_v3.AccessLog{{
 		Name:       "envoy.access_loggers.http_grpc",
@@ -110,15 +115,23 @@ func buildAccessLogs(options *config.Options) []*envoy_config_accesslog_v3.Acces
 	}}
 }
 
-func buildAddress(hostport string, defaultPort int) *envoy_config_core_v3.Address {
+func buildTCPAddress(hostport string, defaultPort uint32) *envoy_config_core_v3.Address {
+	return buildAddress(envoy_config_core_v3.SocketAddress_TCP, hostport, defaultPort)
+}
+
+func buildUDPAddress(hostport string, defaultPort uint32) *envoy_config_core_v3.Address {
+	return buildAddress(envoy_config_core_v3.SocketAddress_UDP, hostport, defaultPort)
+}
+
+func buildAddress(protocol envoy_config_core_v3.SocketAddress_Protocol, hostport string, defaultPort uint32) *envoy_config_core_v3.Address {
 	host, strport, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport
 		strport = fmt.Sprint(defaultPort)
 	}
-	port, err := strconv.Atoi(strport)
-	if err != nil {
-		port = defaultPort
+	port := defaultPort
+	if p, err := strconv.ParseUint(strport, 10, 32); err == nil {
+		port = uint32(p)
 	}
 	if host == "" {
 		if nettest.SupportsIPv6() {
@@ -127,46 +140,20 @@ func buildAddress(hostport string, defaultPort int) *envoy_config_core_v3.Addres
 			host = "0.0.0.0"
 		}
 	}
+
+	is4in6 := false
+	if addr, err := netip.ParseAddr(host); err == nil {
+		is4in6 = addr.Is4In6()
+	}
+
 	return &envoy_config_core_v3.Address{
 		Address: &envoy_config_core_v3.Address_SocketAddress{SocketAddress: &envoy_config_core_v3.SocketAddress{
+			Protocol:      protocol,
 			Address:       host,
-			PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{PortValue: uint32(port)},
-			Ipv4Compat:    true,
+			PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{PortValue: port},
+			Ipv4Compat:    host == "::" || is4in6,
 		}},
 	}
-}
-
-func (b *Builder) envoyTLSCertificateFromGoTLSCertificate(
-	ctx context.Context,
-	cert *tls.Certificate,
-) *envoy_extensions_transport_sockets_tls_v3.TlsCertificate {
-	envoyCert := &envoy_extensions_transport_sockets_tls_v3.TlsCertificate{}
-	var chain bytes.Buffer
-	for _, cbs := range cert.Certificate {
-		_ = pem.Encode(&chain, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: cbs,
-		})
-	}
-	envoyCert.CertificateChain = b.filemgr.BytesDataSource("tls-crt.pem", chain.Bytes())
-	if cert.OCSPStaple != nil {
-		envoyCert.OcspStaple = b.filemgr.BytesDataSource("ocsp-staple", cert.OCSPStaple)
-	}
-	if bs, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey); err == nil {
-		envoyCert.PrivateKey = b.filemgr.BytesDataSource("tls-key.pem", pem.EncodeToMemory(
-			&pem.Block{
-				Type:  "PRIVATE KEY",
-				Bytes: bs,
-			},
-		))
-	} else {
-		log.Warn(ctx).Err(err).Msg("failed to marshal private key for tls config")
-	}
-	for _, scts := range cert.SignedCertificateTimestamps {
-		envoyCert.SignedCertificateTimestamp = append(envoyCert.SignedCertificateTimestamp,
-			b.filemgr.BytesDataSource("signed-certificate-timestamp", scts))
-	}
-	return envoyCert
 }
 
 var rootCABundle struct {
@@ -174,7 +161,7 @@ var rootCABundle struct {
 	value string
 }
 
-func getRootCertificateAuthority() (string, error) {
+func getRootCertificateAuthority(ctx context.Context) (string, error) {
 	rootCABundle.Do(func() {
 		// from https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/security/ssl#arch-overview-ssl-enabling-verification
 		knownRootLocations := []string{
@@ -192,10 +179,10 @@ func getRootCertificateAuthority() (string, error) {
 			}
 		}
 		if rootCABundle.value == "" {
-			log.Error(context.TODO()).Strs("known-locations", knownRootLocations).
+			log.Ctx(ctx).Error().Strs("known-locations", knownRootLocations).
 				Msgf("no root certificates were found in any of the known locations")
 		} else {
-			log.Info(context.TODO()).Msgf("using %s as the system root certificate authority bundle", rootCABundle.value)
+			log.Ctx(ctx).Info().Msgf("using %s as the system root certificate authority bundle", rootCABundle.value)
 		}
 	})
 	if rootCABundle.value == "" {
@@ -204,45 +191,34 @@ func getRootCertificateAuthority() (string, error) {
 	return rootCABundle.value, nil
 }
 
-func getCombinedCertificateAuthority(customCA, customCAFile string) ([]byte, error) {
-	rootFile, err := getRootCertificateAuthority()
+func getCombinedCertificateAuthority(ctx context.Context, cfg *config.Config) ([]byte, error) {
+	rootFile, err := getRootCertificateAuthority(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	combined, err := os.ReadFile(rootFile)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := fileutil.CopyFileUpTo(&buf, rootFile, 5<<20); err != nil {
 		return nil, fmt.Errorf("error reading root certificates: %w", err)
 	}
+	buf.WriteRune('\n')
 
-	if customCA != "" {
-		bs, err := base64.StdEncoding.DecodeString(customCA)
-		if err != nil {
-			return nil, err
-		}
-		combined = append(combined, '\n')
-		combined = append(combined, bs...)
+	all, err := cfg.AllCertificateAuthoritiesPEM()
+	if err != nil {
+		return nil, fmt.Errorf("get all CA: %w", err)
 	}
+	buf.Write(all)
 
-	if customCAFile != "" {
-		bs, err := os.ReadFile(customCAFile)
-		if err != nil {
-			return nil, err
-		}
-		combined = append(combined, '\n')
-		combined = append(combined, bs...)
-	}
-
-	return combined, nil
+	return buf.Bytes(), nil
 }
 
 func marshalAny(msg proto.Message) *anypb.Any {
-	any := new(anypb.Any)
-	_ = anypb.MarshalFrom(any, msg, proto.MarshalOptions{
+	data := new(anypb.Any)
+	_ = anypb.MarshalFrom(data, msg, proto.MarshalOptions{
 		AllowPartial:  true,
 		Deterministic: true,
 	})
-	return any
+	return data
 }
 
 // parseAddress parses a string address into an envoy address.
@@ -252,7 +228,7 @@ func parseAddress(raw string) (*envoy_config_core_v3.Address, error) {
 			host = "127.0.0.1"
 		}
 
-		if port, err := strconv.Atoi(portstr); err == nil {
+		if port, err := strconv.ParseUint(portstr, 10, 32); err == nil {
 			return &envoy_config_core_v3.Address{
 				Address: &envoy_config_core_v3.Address_SocketAddress{
 					SocketAddress: &envoy_config_core_v3.SocketAddress{

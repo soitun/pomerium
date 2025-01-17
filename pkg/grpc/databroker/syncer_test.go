@@ -87,7 +87,7 @@ func TestSyncer(t *testing.T) {
 			}
 			return nil
 		},
-		syncLatest: func(req *SyncLatestRequest, server DataBrokerService_SyncLatestServer) error {
+		syncLatest: func(_ *SyncLatestRequest, server DataBrokerService_SyncLatestServer) error {
 			syncLatestCount++
 			switch syncLatestCount {
 			case 1:
@@ -157,14 +157,14 @@ func TestSyncer(t *testing.T) {
 
 	clearCh := make(chan struct{})
 	updateCh := make(chan []*Record)
-	syncer := NewSyncer("test", testSyncerHandler{
+	syncer := NewSyncer(ctx, "test", testSyncerHandler{
 		getDataBrokerServiceClient: func() DataBrokerServiceClient {
 			return NewDataBrokerServiceClient(gc)
 		},
-		clearRecords: func(ctx context.Context) {
+		clearRecords: func(_ context.Context) {
 			clearCh <- struct{}{}
 		},
-		updateRecords: func(ctx context.Context, serverVersion uint64, records []*Record) {
+		updateRecords: func(_ context.Context, _ uint64, records []*Record) {
 			updateCh <- records
 		},
 	})
@@ -205,15 +205,9 @@ func TestSyncer(t *testing.T) {
 
 	select {
 	case <-ctx.Done():
-		t.Fatal("6. expected call to clear records due to skipped version")
-	case <-clearCh:
-	}
-
-	select {
-	case <-ctx.Done():
-		t.Fatal("7. expected call to update records")
+		t.Fatal("6. expected call to update records")
 	case records := <-updateCh:
-		testutil.AssertProtoJSONEqual(t, `[{"id": "r3", "version": "1002"}, {"id": "r5", "version": "1004"}]`, records)
+		testutil.AssertProtoJSONEqual(t, `[{"id": "r5", "version": "1004"}]`, records)
 	}
 
 	assert.NoError(t, syncer.Close())

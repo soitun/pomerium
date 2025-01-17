@@ -1,6 +1,7 @@
 package criteria
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,10 +13,10 @@ func TestCORSPreflight(t *testing.T) {
 allow:
   and:
     - cors_preflight: 1
-`, []dataBrokerRecord{}, Input{HTTP: InputHTTP{
+`, nil, Input{HTTP: InputHTTP{
 			Method: "OPTIONS",
 			Headers: map[string][]string{
-				"Access-Control-Request-Method": {"GET"},
+				"Access-Control-Request-Method": {http.MethodGet},
 				"Origin":                        {"example.com"},
 			},
 		}})
@@ -28,7 +29,7 @@ allow:
 allow:
   and:
     - cors_preflight: 1
-`, []dataBrokerRecord{}, Input{HTTP: InputHTTP{
+`, nil, Input{HTTP: InputHTTP{
 			Method: "OPTIONS",
 		}})
 		require.NoError(t, err)

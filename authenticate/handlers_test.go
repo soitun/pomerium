@@ -5,48 +5,47 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-jose/go-jose/v3/jwt"
-	"github.com/golang/mock/gomock"
-	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/pomerium/pomerium/authenticate/handlers/webauthn"
 	"github.com/pomerium/pomerium/config"
-	"github.com/pomerium/pomerium/internal/encoding"
+	"github.com/pomerium/pomerium/internal/atomicutil"
 	"github.com/pomerium/pomerium/internal/encoding/jws"
 	"github.com/pomerium/pomerium/internal/encoding/mock"
+	"github.com/pomerium/pomerium/internal/handlers"
 	"github.com/pomerium/pomerium/internal/httputil"
-	"github.com/pomerium/pomerium/internal/identity"
-	"github.com/pomerium/pomerium/internal/identity/oidc"
 	"github.com/pomerium/pomerium/internal/sessions"
 	mstore "github.com/pomerium/pomerium/internal/sessions/mock"
+	"github.com/pomerium/pomerium/internal/testutil"
 	"github.com/pomerium/pomerium/internal/urlutil"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
+	configproto "github.com/pomerium/pomerium/pkg/grpc/config"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
-	"github.com/pomerium/pomerium/pkg/grpc/directory"
-	"github.com/pomerium/pomerium/pkg/grpc/session"
+	"github.com/pomerium/pomerium/pkg/identity"
+	"github.com/pomerium/pomerium/pkg/identity/oidc"
 )
 
 func testAuthenticate() *Authenticate {
 	redirectURL, _ := url.Parse("https://auth.example.com/oauth/callback")
 	var auth Authenticate
-	auth.state = newAtomicAuthenticateState(&authenticateState{
+	auth.state = atomicutil.NewValue(&authenticateState{
 		redirectURL:  redirectURL,
 		cookieSecret: cryptutil.NewKey(),
+		flow:         new(stubFlow),
 	})
 	auth.options = config.NewAtomicOptions()
 	auth.options.Store(&config.Options{
@@ -57,7 +56,7 @@ func testAuthenticate() *Authenticate {
 
 func TestAuthenticate_RobotsTxt(t *testing.T) {
 	auth := testAuthenticate()
-	req, err := http.NewRequest("GET", "/robots.txt", nil)
+	req, err := http.NewRequest(http.MethodGet, "/robots.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +66,7 @@ func TestAuthenticate_RobotsTxt(t *testing.T) {
 	if status := rr.Code; status != http.StatusOK {
 		t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
 	}
-	expected := fmt.Sprintf("User-agent: *\nDisallow: /")
+	expected := "User-agent: *\nDisallow: /"
 	if rr.Body.String() != expected {
 		t.Errorf("handler returned wrong body: got %v want %v", rr.Body.String(), expected)
 	}
@@ -80,12 +79,12 @@ func TestAuthenticate_Handler(t *testing.T) {
 	if h == nil {
 		t.Error("handler cannot be nil")
 	}
-	req := httptest.NewRequest("GET", "/robots.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
 	req.Header.Set("Accept", "application/json")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-	expected := fmt.Sprintf("User-agent: *\nDisallow: /")
+	expected := "User-agent: *\nDisallow: /"
 
 	body := rr.Body.String()
 	if body != expected {
@@ -95,11 +94,11 @@ func TestAuthenticate_Handler(t *testing.T) {
 	// cors preflight
 	req = httptest.NewRequest(http.MethodOptions, "/.pomerium/sign_in", nil)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
 	req.Header.Set("Access-Control-Request-Headers", "X-Requested-With")
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-	expected = fmt.Sprintf("User-agent: *\nDisallow: /")
+	expected = "User-agent: *\nDisallow: /"
 	code := rr.Code
 	if code/100 != 2 {
 		t.Errorf("bad preflight code %v", code)
@@ -108,90 +107,6 @@ func TestAuthenticate_Handler(t *testing.T) {
 	body = resp.Header.Get("vary")
 	if body == "" {
 		t.Errorf("handler returned unexpected body: got %v want %v", body, expected)
-	}
-}
-
-func TestAuthenticate_SignIn(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-
-		scheme string
-		host   string
-		qp     map[string]string
-
-		session  sessions.SessionStore
-		provider identity.MockProvider
-		encoder  encoding.MarshalUnmarshaler
-		wantCode int
-	}{
-		{"good", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"good alternate port", "https", "corp.example.example:8443", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"session not valid", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"bad redirect uri query", "", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "^^^"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusBadRequest},
-		{"bad marshal", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{MarshalError: errors.New("error")}, http.StatusBadRequest},
-		{"session error", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{LoadError: errors.New("error")}, identity.MockProvider{}, &mock.Encoder{}, http.StatusBadRequest},
-		{"good with different programmatic redirect", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/", urlutil.QueryCallbackURI: "https://some.example"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"encrypted encoder error", "https", "corp.example.example", map[string]string{urlutil.QueryRedirectURI: "https://dst.some.example/", urlutil.QueryCallbackURI: "https://some.example"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{MarshalError: errors.New("error")}, http.StatusBadRequest},
-		{"good with callback uri set", "https", "corp.example.example", map[string]string{urlutil.QueryCallbackURI: "https://some.example/", urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"bad callback uri set", "https", "corp.example.example", map[string]string{urlutil.QueryCallbackURI: "^", urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusBadRequest},
-		{"good programmatic request", "https", "corp.example.example", map[string]string{urlutil.QueryIsProgrammatic: "true", urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-		{"good additional audience", "https", "corp.example.example", map[string]string{urlutil.QueryForwardAuth: "x.y.z", urlutil.QueryRedirectURI: "https://dst.some.example/"}, &mstore.Store{Session: &sessions.State{}}, identity.MockProvider{}, &mock.Encoder{}, http.StatusFound},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			sharedCipher, _ := cryptutil.NewAEADCipherFromBase64(cryptutil.NewBase64Key())
-
-			a := &Authenticate{
-				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(options *config.Options, idpID string) (identity.Authenticator, error) {
-					return tt.provider, nil
-				})),
-				state: newAtomicAuthenticateState(&authenticateState{
-					sharedCipher:     sharedCipher,
-					sessionStore:     tt.session,
-					redirectURL:      uriParseHelper("https://some.example"),
-					sharedEncoder:    tt.encoder,
-					encryptedEncoder: tt.encoder,
-					dataBrokerClient: mockDataBrokerServiceClient{
-						get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-							return &databroker.GetResponse{
-								Record: databroker.NewRecord(&session.Session{
-									Id: "SESSION_ID",
-								}),
-							}, nil
-						},
-					},
-					directoryClient: new(mockDirectoryServiceClient),
-				}),
-
-				options: config.NewAtomicOptions(),
-			}
-			a.options.Store(&config.Options{SharedKey: base64.StdEncoding.EncodeToString(cryptutil.NewKey())})
-			uri := &url.URL{Scheme: tt.scheme, Host: tt.host}
-
-			queryString := uri.Query()
-			for k, v := range tt.qp {
-				queryString.Set(k, v)
-			}
-			uri.RawQuery = queryString.Encode()
-			r := httptest.NewRequest(http.MethodGet, uri.String(), nil)
-			r.Header.Set("Accept", "application/json")
-			state, err := tt.session.LoadSession(r)
-			ctx := r.Context()
-			ctx = sessions.NewContext(ctx, state, err)
-			r = r.WithContext(ctx)
-
-			w := httptest.NewRecorder()
-			httputil.HandlerFunc(a.SignIn).ServeHTTP(w, r)
-			if status := w.Code; status != tt.wantCode {
-				t.Errorf("handler returned wrong status code: got %v want %v %s", status, tt.wantCode, uri)
-				t.Errorf("\n%+v", w.Body)
-			}
-		})
 	}
 }
 
@@ -217,6 +132,7 @@ func TestAuthenticate_SignOut(t *testing.T) {
 		sessionStore sessions.SessionStore
 		wantCode     int
 		wantBody     string
+		wantLocation string
 	}{
 		{
 			"good post",
@@ -226,10 +142,11 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			"",
 			"sig",
 			"ts",
-			identity.MockProvider{LogOutResponse: (*uriParseHelper("https://microsoft.com"))},
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented},
 			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
 			http.StatusFound,
 			"",
+			"https://corp.pomerium.io/",
 		},
 		{
 			"signout redirect url",
@@ -239,10 +156,25 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			"https://signout-redirect-url.example.com",
 			"sig",
 			"ts",
-			identity.MockProvider{LogOutResponse: (*uriParseHelper("https://microsoft.com"))},
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented},
 			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
 			http.StatusFound,
 			"",
+			"https://signout-redirect-url.example.com",
+		},
+		{
+			"empty redirect url",
+			http.MethodPost,
+			nil,
+			"",
+			"",
+			"sig",
+			"ts",
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented},
+			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
+			http.StatusFound,
+			"",
+			"https://authenticate.pomerium.app/.pomerium/signed_out",
 		},
 		{
 			"failed revoke",
@@ -252,10 +184,11 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			"",
 			"sig",
 			"ts",
-			identity.MockProvider{RevokeError: errors.New("OH NO")},
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented, RevokeError: errors.New("OH NO")},
 			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
 			http.StatusFound,
 			"",
+			"https://corp.pomerium.io/",
 		},
 		{
 			"load session error",
@@ -265,10 +198,11 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			"",
 			"sig",
 			"ts",
-			identity.MockProvider{RevokeError: errors.New("OH NO")},
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented, RevokeError: errors.New("OH NO")},
 			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
 			http.StatusFound,
 			"",
+			"https://corp.pomerium.io/",
 		},
 		{
 			"bad redirect uri",
@@ -278,23 +212,11 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			"",
 			"sig",
 			"ts",
-			identity.MockProvider{LogOutError: oidc.ErrSignoutNotImplemented},
+			identity.MockProvider{SignOutError: oidc.ErrSignoutNotImplemented},
 			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
 			http.StatusFound,
 			"",
-		},
-		{
-			"no redirect uri",
-			http.MethodPost,
-			nil,
-			"",
-			"",
-			"sig",
-			"ts",
-			identity.MockProvider{LogOutResponse: (*uriParseHelper("https://microsoft.com"))},
-			&mstore.Store{Encrypted: true, Session: &sessions.State{}},
-			http.StatusOK,
-			"{\"Status\":200,\"Error\":\"OK: user logged out\"}\n",
+			"/corp.pomerium.io/",
 		},
 	}
 	for _, tt := range tests {
@@ -303,26 +225,13 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 			a := &Authenticate{
-				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(options *config.Options, idpID string) (identity.Authenticator, error) {
+				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(_ *config.Options, _ string) (identity.Authenticator, error) {
 					return tt.provider, nil
 				})),
-				state: newAtomicAuthenticateState(&authenticateState{
-					sessionStore:     tt.sessionStore,
-					encryptedEncoder: mock.Encoder{},
-					sharedEncoder:    mock.Encoder{},
-					dataBrokerClient: mockDataBrokerServiceClient{
-						get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-							return &databroker.GetResponse{
-								Record: databroker.NewRecord(&session.Session{
-									Id: "SESSION_ID",
-								}),
-							}, nil
-						},
-						put: func(ctx context.Context, in *databroker.PutRequest, opts ...grpc.CallOption) (*databroker.PutResponse, error) {
-							return nil, nil
-						},
-					},
-					directoryClient: new(mockDirectoryServiceClient),
+				state: atomicutil.NewValue(&authenticateState{
+					sessionStore:  tt.sessionStore,
+					sharedEncoder: mock.Encoder{},
+					flow:          new(stubFlow),
 				}),
 				options: config.NewAtomicOptions(),
 			}
@@ -335,7 +244,9 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			params, _ := url.ParseQuery(u.RawQuery)
 			params.Add("sig", tt.sig)
 			params.Add("ts", tt.ts)
-			params.Add(urlutil.QueryRedirectURI, tt.redirectURL)
+			if tt.redirectURL != "" {
+				params.Add(urlutil.QueryRedirectURI, tt.redirectURL)
+			}
 			u.RawQuery = params.Encode()
 			r := httptest.NewRequest(tt.method, u.String(), nil)
 			state, err := tt.sessionStore.LoadSession(r)
@@ -356,12 +267,44 @@ func TestAuthenticate_SignOut(t *testing.T) {
 			if diff := cmp.Diff(body, tt.wantBody); diff != "" {
 				t.Errorf("handler returned wrong body Body: %s", diff)
 			}
-			if tt.signoutRedirectURL != "" {
-				loc := w.Header().Get("Location")
-				assert.Contains(t, loc, url.QueryEscape(tt.signoutRedirectURL))
-			}
+			loc := w.Header().Get("Location")
+			assert.Equal(t, tt.wantLocation, loc)
 		})
 	}
+}
+
+func TestAuthenticate_SignOutDoesNotRequireSession(t *testing.T) {
+	// A direct sign_out request would not be signed.
+	f := new(stubFlow)
+	f.verifySignatureErr = errors.New("no signature")
+
+	sessionStore := &mstore.Store{LoadError: errors.New("no session")}
+	a := &Authenticate{
+		cfg: getAuthenticateConfig(WithGetIdentityProvider(func(_ *config.Options, _ string) (identity.Authenticator, error) {
+			return identity.MockProvider{}, nil
+		})),
+		state: atomicutil.NewValue(&authenticateState{
+			cookieSecret:  cryptutil.NewKey(),
+			sessionLoader: sessionStore,
+			sessionStore:  sessionStore,
+			sharedEncoder: mock.Encoder{},
+			flow:          f,
+		}),
+		options: config.NewAtomicOptions(),
+	}
+	r := httptest.NewRequest(http.MethodGet, "/.pomerium/sign_out", nil)
+	w := httptest.NewRecorder()
+
+	a.Handler().ServeHTTP(w, r)
+	result := w.Result()
+
+	// The handler should serve a sign out confirmation page, not a login redirect.
+	expectedStatus := "200 OK"
+	if result.Status != expectedStatus {
+		t.Fatalf("wrong status code: got %q want %q", result.Status, expectedStatus)
+	}
+	body, _ := io.ReadAll(result.Body)
+	assert.Contains(t, string(body), `"page":"SignOutConfirm"`)
 }
 
 func TestAuthenticate_OAuthCallback(t *testing.T) {
@@ -397,7 +340,7 @@ func TestAuthenticate_OAuthCallback(t *testing.T) {
 		{"bad timing - too soon", http.MethodGet, time.Now().Add(1 * time.Hour).Unix(), "", "", "", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
 		{"bad timing - expired", http.MethodGet, time.Now().Add(-1 * time.Hour).Unix(), "", "", "", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
 		{"bad base64", http.MethodGet, time.Now().Unix(), "", "", "^", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
-		{"too many seperators", http.MethodGet, time.Now().Unix(), "", "", "|ok|now|what", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
+		{"too many separators", http.MethodGet, time.Now().Unix(), "", "", "|ok|now|what", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
 		{"bad hmac", http.MethodGet, time.Now().Unix(), "", "NOTMAC", "", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
 		{"bad hmac", http.MethodGet, time.Now().Unix(), base64.URLEncoding.EncodeToString([]byte("malformed_state")), "", "", "", "code", "https://corp.pomerium.io", "https://authenticate.pomerium.io", &mstore.Store{}, identity.MockProvider{AuthenticateResponse: oauth2.Token{}}, "https://corp.pomerium.io", http.StatusBadRequest},
 	}
@@ -410,29 +353,16 @@ func TestAuthenticate_OAuthCallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			signer, err := jws.NewHS256Signer(nil)
-			if err != nil {
-				t.Fatal(err)
-			}
 			authURL, _ := url.Parse(tt.authenticateURL)
 			a := &Authenticate{
-				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(options *config.Options, idpID string) (identity.Authenticator, error) {
+				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(_ *config.Options, _ string) (identity.Authenticator, error) {
 					return tt.provider, nil
 				})),
-				state: newAtomicAuthenticateState(&authenticateState{
-					dataBrokerClient: mockDataBrokerServiceClient{
-						get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-							return nil, fmt.Errorf("not implemented")
-						},
-						put: func(ctx context.Context, in *databroker.PutRequest, opts ...grpc.CallOption) (*databroker.PutResponse, error) {
-							return nil, nil
-						},
-					},
-					directoryClient:  new(mockDirectoryServiceClient),
-					redirectURL:      authURL,
-					sessionStore:     tt.session,
-					cookieCipher:     aead,
-					encryptedEncoder: signer,
+				state: atomicutil.NewValue(&authenticateState{
+					redirectURL:  authURL,
+					sessionStore: tt.session,
+					cookieCipher: aead,
+					flow:         new(stubFlow),
 				}),
 				options: config.NewAtomicOptions(),
 			}
@@ -471,11 +401,13 @@ func TestAuthenticate_OAuthCallback(t *testing.T) {
 
 func TestAuthenticate_SessionValidatorMiddleware(t *testing.T) {
 	t.Parallel()
-	fn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fn := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "RVSI FILIVS CAISAR")
 		w.WriteHeader(http.StatusOK)
 	})
+
+	idp, _ := new(config.Options).GetIdentityProviderForID("")
 
 	tests := []struct {
 		name    string
@@ -488,49 +420,33 @@ func TestAuthenticate_SessionValidatorMiddleware(t *testing.T) {
 		wantStatus int
 	}{
 		{
-			"good",
-			nil,
-			&mstore.Store{Session: &sessions.State{ID: "xyz"}},
-			nil,
-			identity.MockProvider{RefreshResponse: oauth2.Token{Expiry: time.Now().Add(10 * time.Minute)}},
-			http.StatusOK,
-		},
-		{
 			"invalid session",
 			nil,
-			&mstore.Store{Session: &sessions.State{ID: "xyz"}},
+			&mstore.Store{Session: &sessions.State{IdentityProviderID: idp.GetId(), ID: "xyz"}},
 			errors.New("hi"),
 			identity.MockProvider{},
-			http.StatusFound,
-		},
-		{
-			"good refresh expired",
-			nil,
-			&mstore.Store{Session: &sessions.State{ID: "xyz"}},
-			nil,
-			identity.MockProvider{RefreshResponse: oauth2.Token{Expiry: time.Now().Add(10 * time.Minute)}},
 			http.StatusOK,
 		},
 		{
 			"expired,refresh error",
 			nil,
-			&mstore.Store{Session: &sessions.State{ID: "xyz"}},
+			&mstore.Store{Session: &sessions.State{IdentityProviderID: idp.GetId(), ID: "xyz"}},
 			sessions.ErrExpired,
 			identity.MockProvider{RefreshError: errors.New("error")},
-			http.StatusFound,
+			http.StatusOK,
 		},
 		{
 			"expired,save error",
 			nil,
-			&mstore.Store{SaveError: errors.New("error"), Session: &sessions.State{ID: "xyz"}},
+			&mstore.Store{SaveError: errors.New("error"), Session: &sessions.State{IdentityProviderID: idp.GetId(), ID: "xyz"}},
 			sessions.ErrExpired,
 			identity.MockProvider{RefreshResponse: oauth2.Token{Expiry: time.Now().Add(10 * time.Minute)}},
-			http.StatusFound,
+			http.StatusOK,
 		},
 		{
 			"expired XHR,refresh error",
 			map[string]string{"X-Requested-With": "XmlHttpRequest"},
-			&mstore.Store{Session: &sessions.State{ID: "xyz"}},
+			&mstore.Store{Session: &sessions.State{IdentityProviderID: idp.GetId(), ID: "xyz"}},
 			sessions.ErrExpired,
 			identity.MockProvider{RefreshError: errors.New("error")},
 			http.StatusUnauthorized,
@@ -551,30 +467,20 @@ func TestAuthenticate_SessionValidatorMiddleware(t *testing.T) {
 				t.Fatal(err)
 			}
 			a := &Authenticate{
-				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(options *config.Options, idpID string) (identity.Authenticator, error) {
+				cfg: getAuthenticateConfig(WithGetIdentityProvider(func(_ *config.Options, _ string) (identity.Authenticator, error) {
 					return tt.provider, nil
 				})),
-				state: newAtomicAuthenticateState(&authenticateState{
-					cookieSecret:     cryptutil.NewKey(),
-					redirectURL:      uriParseHelper("https://authenticate.corp.beyondperimeter.com"),
-					sessionStore:     tt.session,
-					cookieCipher:     aead,
-					encryptedEncoder: signer,
-					sharedEncoder:    signer,
-					dataBrokerClient: mockDataBrokerServiceClient{
-						get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-							return &databroker.GetResponse{
-								Record: databroker.NewRecord(&session.Session{
-									Id: "SESSION_ID",
-								}),
-							}, nil
-						},
-					},
-					directoryClient: new(mockDirectoryServiceClient),
+				state: atomicutil.NewValue(&authenticateState{
+					cookieSecret:  cryptutil.NewKey(),
+					redirectURL:   uriParseHelper("https://authenticate.corp.beyondperimeter.com"),
+					sessionStore:  tt.session,
+					cookieCipher:  aead,
+					sharedEncoder: signer,
+					flow:          new(stubFlow),
 				}),
 				options: config.NewAtomicOptions(),
 			}
-			r := httptest.NewRequest("GET", "/", nil)
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
 			state, err := tt.session.LoadSession(r)
 			if err != nil {
 				t.Fatal(err)
@@ -600,52 +506,16 @@ func TestAuthenticate_SessionValidatorMiddleware(t *testing.T) {
 	}
 }
 
-func TestWellKnownEndpoint(t *testing.T) {
-	auth := testAuthenticate()
-
-	h := auth.Handler()
-	if h == nil {
-		t.Error("handler cannot be nil")
-	}
-	req := httptest.NewRequest("GET", "/.well-known/pomerium/", nil)
-	req.Header.Set("Accept", "application/json")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	body := rr.Body.String()
-	expected := "{\"authentication_callback_endpoint\":\"https://auth.example.com/oauth2/callback\",\"jwks_uri\":\"https://auth.example.com/.well-known/pomerium/jwks.json\",\"frontchannel_logout_uri\":\"https://auth.example.com/.pomerium/sign_out\"}\n"
-	assert.Equal(t, body, expected)
-}
-
-func TestJwksEndpoint(t *testing.T) {
-	o := newTestOptions(t)
-	o.SigningKey = "LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSUpCMFZkbko1VjEvbVlpYUlIWHhnd2Q0Yzd5YWRTeXMxb3Y0bzA1b0F3ekdvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFVUc1eENQMEpUVDFINklvbDhqS3VUSVBWTE0wNENnVzlQbEV5cE5SbVdsb29LRVhSOUhUMwpPYnp6aktZaWN6YjArMUt3VjJmTVRFMTh1dy82MXJVQ0JBPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo="
-	auth, err := New(&config.Config{Options: o})
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
-	h := auth.Handler()
-	if h == nil {
-		t.Error("handler cannot be nil")
-	}
-	req := httptest.NewRequest("GET", "/.well-known/pomerium/jwks.json", nil)
-	req.Header.Set("Accept", "application/json")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	body := rr.Body.String()
-	expected := "{\"keys\":[{\"use\":\"sig\",\"kty\":\"EC\",\"kid\":\"5b419ade1895fec2d2def6cd33b1b9a018df60db231dc5ecb85cbed6d942813c\",\"crv\":\"P-256\",\"alg\":\"ES256\",\"x\":\"UG5xCP0JTT1H6Iol8jKuTIPVLM04CgW9PlEypNRmWlo\",\"y\":\"KChF0fR09zm884ymInM29PtSsFdnzExNfLsP-ta1AgQ\"}]}\n"
-	assert.Equal(t, expected, body)
-}
-
 func TestAuthenticate_userInfo(t *testing.T) {
 	t.Parallel()
 
 	t.Run("cookie-redirect-uri", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest("GET", "https://authenticate.service.cluster.local/.pomerium/?pomerium_redirect_uri=https://www.example.com", nil)
+		r := httptest.NewRequest(http.MethodGet, "https://authenticate.service.cluster.local/.pomerium/?pomerium_redirect_uri=https://www.example.com", nil)
 		var a Authenticate
-		a.state = newAtomicAuthenticateState(&authenticateState{
+		a.state = atomicutil.NewValue(&authenticateState{
 			cookieSecret: cryptutil.NewKey(),
+			flow:         new(stubFlow),
 		})
 		a.options = config.NewAtomicOptions()
 		a.options.Store(&config.Options{
@@ -661,36 +531,32 @@ func TestAuthenticate_userInfo(t *testing.T) {
 
 	now := time.Now()
 	tests := []struct {
-		name         string
-		url          *url.URL
-		method       string
-		sessionStore sessions.SessionStore
-		wantCode     int
-		wantBody     string
+		name           string
+		url            string
+		validSignature bool
+		sessionStore   sessions.SessionStore
+		wantCode       int
 	}{
 		{
-			"good",
-			mustParseURL("/"),
-			http.MethodGet,
+			"not a redirect",
+			"/",
+			true,
 			&mstore.Store{Encrypted: true, Session: &sessions.State{ID: "SESSION_ID", IssuedAt: jwt.NewNumericDate(now)}},
 			http.StatusOK,
-			"",
 		},
 		{
-			"missing signature",
-			mustParseURL("/?pomerium_redirect_uri=http://example.com"),
-			http.MethodGet,
+			"signed redirect",
+			"/?pomerium_redirect_uri=http://example.com",
+			true,
 			&mstore.Store{Encrypted: true, Session: &sessions.State{ID: "SESSION_ID", IssuedAt: jwt.NewNumericDate(now)}},
-			http.StatusBadRequest,
-			"",
+			http.StatusFound,
 		},
 		{
-			"bad signature",
-			urlutil.NewSignedURL([]byte("BAD KEY"), mustParseURL("/?pomerium_redirect_uri=http://example.com")).Sign(),
-			http.MethodGet,
+			"invalid redirect",
+			"/?pomerium_redirect_uri=http://example.com",
+			false,
 			&mstore.Store{Encrypted: true, Session: &sessions.State{ID: "SESSION_ID", IssuedAt: jwt.NewNumericDate(now)}},
 			http.StatusBadRequest,
-			"",
 		},
 	}
 	for _, tt := range tests {
@@ -707,28 +573,19 @@ func TestAuthenticate_userInfo(t *testing.T) {
 				AuthenticateURLString: "https://authenticate.localhost.pomerium.io",
 				SharedKey:             "SHARED KEY",
 			})
+			f := new(stubFlow)
+			if !tt.validSignature {
+				f.verifySignatureErr = errors.New("bad signature")
+			}
 			a := &Authenticate{
 				options: o,
-				state: newAtomicAuthenticateState(&authenticateState{
-					sessionStore:     tt.sessionStore,
-					encryptedEncoder: signer,
-					sharedEncoder:    signer,
-					dataBrokerClient: mockDataBrokerServiceClient{
-						get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-							return &databroker.GetResponse{
-								Record: databroker.NewRecord(&session.Session{
-									Id:      "SESSION_ID",
-									UserId:  "USER_ID",
-									IdToken: &session.IDToken{IssuedAt: timestamppb.New(now)},
-								}),
-							}, nil
-						},
-					},
-					directoryClient: new(mockDirectoryServiceClient),
+				state: atomicutil.NewValue(&authenticateState{
+					sessionStore:  tt.sessionStore,
+					sharedEncoder: signer,
+					flow:          f,
 				}),
 			}
-			a.webauthn = webauthn.New(a.getWebauthnState)
-			r := httptest.NewRequest(tt.method, tt.url.String(), nil)
+			r := httptest.NewRequest(http.MethodGet, tt.url, nil)
 			state, err := tt.sessionStore.LoadSession(r)
 			if err != nil {
 				t.Fatal(err)
@@ -743,12 +600,89 @@ func TestAuthenticate_userInfo(t *testing.T) {
 			if status := w.Code; status != tt.wantCode {
 				t.Errorf("handler returned wrong status code: got %v want %v", status, tt.wantCode)
 			}
-			body := w.Body.String()
-			if !strings.Contains(body, tt.wantBody) {
-				t.Errorf("Unexpected body, contains: %s, got: %s", tt.wantBody, body)
-			}
 		})
 	}
+}
+
+func TestAuthenticate_CORS(t *testing.T) {
+	f := new(stubFlow)
+	auth := testAuthenticate()
+	state := auth.state.Load()
+	state.sessionLoader = &mstore.Store{Session: &sessions.State{}}
+	state.sharedEncoder = mock.Encoder{}
+	state.flow = f
+	auth.state.Store(state)
+
+	t.Run("unsigned", func(t *testing.T) {
+		f.verifySignatureErr = errors.New("no signature")
+		req, _ := http.NewRequest(http.MethodGet, "/.pomerium/", nil)
+		req.Header.Set("Origin", "foo.example.com")
+		rr := httptest.NewRecorder()
+		logOutput := testutil.CaptureLogs(t, func() {
+			auth.Handler().ServeHTTP(rr, req)
+		})
+		assert.NotContains(t, logOutput, "authenticate: signed URL")
+		h := rr.Result().Header
+		assert.Empty(t, h.Get("Access-Control-Allow-Credentials"))
+		assert.Empty(t, h.Get("Access-Control-Allow-Origin"))
+	})
+	t.Run("signed", func(t *testing.T) {
+		f.verifySignatureErr = nil
+		req, _ := http.NewRequest(http.MethodGet, "/.pomerium/", nil)
+		req.Header.Set("Origin", "foo.example.com")
+		rr := httptest.NewRecorder()
+		logOutput := testutil.CaptureLogs(t, func() {
+			auth.Handler().ServeHTTP(rr, req)
+		})
+		assert.Contains(t, logOutput,
+			`{"level":"info","message":"authenticate: signed URL, adding CORS headers"}`)
+		h := rr.Result().Header
+		assert.Equal(t, "true", h.Get("Access-Control-Allow-Credentials"))
+		assert.Equal(t, "foo.example.com", h.Get("Access-Control-Allow-Origin"))
+	})
+}
+
+func TestSignOutBranding(t *testing.T) {
+	t.Parallel()
+
+	auth := testAuthenticate()
+	auth.state.Load().flow.(*stubFlow).verifySignatureErr = errors.New("unsigned URL")
+	auth.options.Store(&config.Options{
+		BrandingOptions: &configproto.Settings{
+			PrimaryColor:   proto.String("red"),
+			SecondaryColor: proto.String("orange"),
+		},
+	})
+
+	t.Run("sign_out", func(t *testing.T) {
+		t.Parallel()
+
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/.pomerium/sign_out", nil)
+		err := auth.SignOut(w, r)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		b, err := io.ReadAll(w.Body)
+		require.NoError(t, err)
+
+		assert.Contains(t, string(b), `"primaryColor":"red","secondaryColor":"orange"`)
+	})
+
+	t.Run("signed_out", func(t *testing.T) {
+		t.Parallel()
+
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/.pomerium/signed_out", nil)
+		err := auth.signedOut(w, r)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		b, err := io.ReadAll(w.Body)
+		require.NoError(t, err)
+
+		assert.Contains(t, string(b), `"primaryColor":"red","secondaryColor":"orange"`)
+	})
 }
 
 type mockDataBrokerServiceClient struct {
@@ -766,23 +700,49 @@ func (m mockDataBrokerServiceClient) Put(ctx context.Context, in *databroker.Put
 	return m.put(ctx, in, opts...)
 }
 
-type mockDirectoryServiceClient struct {
-	directory.DirectoryServiceClient
-
-	refreshUser func(ctx context.Context, in *directory.RefreshUserRequest, opts ...grpc.CallOption) (*empty.Empty, error)
-}
-
-func (m mockDirectoryServiceClient) RefreshUser(ctx context.Context, in *directory.RefreshUserRequest, opts ...grpc.CallOption) (*empty.Empty, error) {
-	if m.refreshUser != nil {
-		return m.refreshUser(ctx, in, opts...)
-	}
-	return nil, status.Error(codes.Unimplemented, "")
-}
-
 func mustParseURL(rawurl string) *url.URL {
 	u, err := url.Parse(rawurl)
 	if err != nil {
 		panic(err)
 	}
 	return u
+}
+
+// stubFlow is a stub implementation of the flow interface.
+type stubFlow struct {
+	verifySignatureErr error
+}
+
+func (f *stubFlow) VerifyAuthenticateSignature(*http.Request) error {
+	return f.verifySignatureErr
+}
+
+func (*stubFlow) SignIn(http.ResponseWriter, *http.Request, *sessions.State) error {
+	return nil
+}
+
+func (*stubFlow) PersistSession(
+	context.Context, http.ResponseWriter, *sessions.State, identity.SessionClaims, *oauth2.Token,
+) error {
+	return nil
+}
+
+func (*stubFlow) VerifySession(context.Context, *http.Request, *sessions.State) error {
+	return nil
+}
+
+func (*stubFlow) RevokeSession(
+	context.Context, *http.Request, identity.Authenticator, *sessions.State,
+) string {
+	return ""
+}
+
+func (*stubFlow) GetUserInfoData(*http.Request, *sessions.State) handlers.UserInfoData {
+	return handlers.UserInfoData{}
+}
+
+func (*stubFlow) LogAuthenticateEvent(*http.Request) {}
+
+func (*stubFlow) GetIdentityProviderIDForURLValues(url.Values) string {
+	return ""
 }
